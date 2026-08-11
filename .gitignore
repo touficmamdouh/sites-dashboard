@@ -1,0 +1,3 @@
+*.deb
+.debstage/
+__pycache__/

@@ -1,0 +1,120 @@
+# Sites Dashboard 🚀
+
+أداة لإدارة السيرفر المحلي والمواقع: تشغيل/إيقاف الخدمات، إنشاء مواقع،
+نسخ احتياطي، استعادة، SSL، لوحة تحكم تفاعلية (TUI) و أوامر CLI.
+
+يعتمد على: **Nginx + PHP-FPM + MariaDB + WordPress** (اختياري).
+
+---
+
+## ⚡ التثبيت السريع (دقيقة واحدة)
+
+### الطريقة 1: باكج .deb (الأسهل)
+```bash
+# أنزّل آخر نسخة من صفحة Releases، ثم:
+sudo apt install ./sites-dashboard_1.0.0_all.deb
+```
+
+### الطريقة 2: السكربت
+```bash
+git clone https://github.com/touficmamdouh/sites-dashboard.git
+cd sites-dashboard
+./install.sh
+```
+
+### الطريقة 3: البناء اليدوي من المصدر + تركيب
+```bash
+git clone https://github.com/touficmamdouh/sites-dashboard.git
+cd sites-dashboard
+./build.sh          # ينتج sites-dashboard_1.0.0_all.deb
+sudo apt install ./sites-dashboard_1.0.0_all.deb
+```
+
+في الحالتين، السكربت/الباكج **ينزّل تلقائياً** أي مكوّن ناقص:
+- `python3`, `pip`
+- مكتبات بايثون: `typer rich textual`
+- `nginx`, `mariadb`, `php-fpm`, `certbot`, `mkcert`
+- يفعّل الخدمات تلقائياً ويجهّز بيئة `sites`
+
+بعد التثبيت:
+```bash
+source ~/.bashrc
+sites dashboard     # لوحة التحكم التفاعلية
+```
+
+---
+
+## 📁 الإعدادات (اختيارية)
+
+كلها عبر متغيرات بيئة، ماعدا الافتراضي بيتظبط تلقائياً:
+
+| متغير | الوصف | الافتراضي |
+|-------|--------|-----------|
+| `SITES_WEBROOT` | مجلد المواقع | `~/www` |
+| `SITES_BACKUP` | مجلد النسخ الاحتياطي | `~/backups` |
+| `SITES_PHP_SOCK` | منفذ/سوكيت PHP | يكتشف تلقائياً |
+| `SITES_DB_ROOT_USER` / `SITES_DB_ROOT_PASS` | حساب MySQL الأدمن (لإنشاء قواعد البيانات) | root / root |
+| `NGINX_AVAILABLE` / `NGINX_ENABLED` | مجلدات nginx | `/etc/nginx/sites-available` / `-enabled` |
+
+مثال:
+```bash
+export SITES_WEBROOT=/home/me/www
+export SITES_DB_ROOT_PASS="كلمة_السر"
+```
+
+> **ملاحظة:** لو `sudo` محتاج كلمة سر، الاداة هتطلبها مرة وحدة. لو عايز تشغيل بدون كلمة سر:
+> ```
+> sudo visudo
+> # أضف السطر (بدّل USER باسمك):
+> USER ALL=(ALL) NOPASSWD: ALL
+> ```
+
+---
+
+## 🖥️ الأوامر
+
+### لوحة التحكم التفاعلية
+```bash
+sites dashboard
+```
+أزرار: توجيه/فصل/تشغيل/إيقاف/إعادة تشغيل الخدمات، فحص HTTP، إنشاء موقع،
+نسخ احتياطي، لقطة، استعادة، تحديث WordPress، SSL، تصدير.
+
+### CLI
+```bash
+sites list                  # عرض المواقع + حالة الخدمات
+sites services              # حالة الخدمات فقط
+sites check                 # فحص HTTP لكل المواقع
+sites start | stop | restart [name]
+sites create mydomain.test [--wp]   # إنشاء موقع (+ WordPress)
+sites enable mydomain.test | disable mydomain.test
+sites backup mydomain.test          # نسخ احتياطي (ملفات + قاعدة)
+sites restore mydomain.test ~/backups/mydomain.test/20260101_120000
+sites snapshot mydomain.test        # لقطة سريعة
+sites update_wordpress mydomain.test | update_all
+sites ssl mydomain.test             # SSL (certbot للمواقع الحقيقية / mkcert للـ .test)
+sites export mydomain.test          # تصدير الحزمة للنقل
+```
+
+---
+
+## 🧱 المتطلبات يدوياً (لو حابب تعملها بنفسك)
+```bash
+sudo apt update
+sudo apt install -y nginx mariadb-server php-fpm python3-pip certbot python3-certbot-nginx
+python3 -m pip install typer rich textual
+```
+
+---
+
+## 📂 هيكل الملفات
+```
+sites-dashboard/
+├── install.sh      # المثبّت (ينزّل الناقص تلقائياً)
+├── build.sh        # يبني .deb
+├── DEBIAN/         # ملفات الباكج (control / postinst / prerm)
+├── bin/
+│   ├── sites       # الأداة الرئيسية (Python CLI + TUI)
+│   └── newsite     # مساعد إنشاء المواقع
+└── README.md
+```

@@ -1,0 +1,35 @@
+#!/bin/bash
+# postinst - finalize sites-dashboard install
+set -e
+
+# 1. Python packages
+python3 -m pip install --quiet typer rich textual 2>/dev/null || pip3 install --quiet typer rich textual || true
+
+# 2. detect php fpm socket
+detect_php() {
+    for v in /run/php/php*-fpm.sock; do
+        [ -S "$v" ] && { echo "$v"; return; }
+    done
+    echo "/run/php/php8.3-fpm.sock"
+}
+PHP_SOCK=$(detect_php)
+PHP_SVC=$(basename "$PHP_SOCK" .sock)
+
+# 3. env profile for current user
+HOME_DIR=$(getent passwd `logname 2>/dev/null || echo $SUDO_USER 2>/dev/null` | cut -d: -f6)
+[ -z "$HOME_DIR" ] && HOME_DIR=$HOME
+for pf in "$HOME_DIR/.bashrc" "$HOME_DIR/.zshrc"; do
+    [ -f "$pf" ] || continue
+    grep -q '^export SITES_PHP_SOCK=' "$pf" || printf '\nexport SITES_PHP_SOCK="%s"\nexport SITES_PHP_SVC="%s"\n' "$PHP_SOCK" "$PHP_SVC" >> "$pf"
+done
+
+# 4. enable services
+systemctl enable nginx >/dev/null 2>&1 || true
+systemctl enable mariadb >/dev/null 2>&1 || true
+systemctl enable "$PHP_SVC" >/dev/null 2>&1 || true
+
+echo ""
+echo "sites-dashboard installed!"
+echo "  Run:  sites dashboard"
+echo "  PHP socket: $PHP_SOCK (service $PHP_SVC)"
+exit 0

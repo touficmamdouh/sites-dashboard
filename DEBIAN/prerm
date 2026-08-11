@@ -1,0 +1,7 @@
+#!/bin/bash
+set -e
+export DEBCONF_NONINTERACTIVE_SEEN=true
+export DEBIAN_FRONTEND=noninteractive
+apt-get purge -y python3-typer python3-rich python3-textual 2>/dev/null || true
+rm -f /usr/local/bin/sites /usr/local/bin/newsite
+exit 0

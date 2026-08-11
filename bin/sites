@@ -1,0 +1,1215 @@
+#!/usr/bin/env python3
+"""
+sites - Website & Service Manager
+CLI (Typer+Rich) + TUI Dashboard (Textual)
+"""
+
+import os
+import sys
+import re
+import json
+import time
+import shutil
+import subprocess
+from datetime import datetime
+from pathlib import Path
+from typing import Optional, List
+
+SITES_AVAILABLE = Path(os.environ.get("NGINX_AVAILABLE", "/etc/nginx/sites-available"))
+SITES_ENABLED = Path(os.environ.get("NGINX_ENABLED", "/etc/nginx/sites-enabled"))
+WEBROOT = Path(os.environ.get("SITES_WEBROOT", str(Path.home() / "www")))
+BACKUP_DIR = Path(os.environ.get("SITES_BACKUP", str(Path.home() / "backups")))
+
+
+def run(cmd: list, timeout: int = 15) -> tuple[str, str, int]:
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.stdout.strip(), r.stderr.strip(), r.returncode
+    except FileNotFoundError:
+        return "", f"Command not found: {cmd[0]}", -1
+    except subprocess.TimeoutExpired:
+        return "", "Timed out", -1
+
+
+def pkexec(cmd: list) -> tuple[str, str, int]:
+    r = run(["sudo", "-n"] + cmd)
+    if r[2] != 0:
+        r = run(["sudo"] + cmd, timeout=60)
+    return r
+
+
+def php_svc() -> str:
+    return os.environ.get("SITES_PHP_SVC", "php8.3-fpm")
+
+
+def get_site_info(name: str) -> dict:
+    conf = SITES_AVAILABLE / f"{name}.conf"
+    info = {"name": name, "enabled": False, "php": "-", "type": "site", "root": "", "domain": name}
+    if not conf.exists():
+        return info
+    if (SITES_ENABLED / f"{name}.conf").exists():
+        info["enabled"] = True
+    text = conf.read_text()
+    m = re.search(r"root\s+(\S+);", text)
+    if m:
+        info["root"] = m.group(1)
+    m = re.search(r"fastcgi_pass\s+unix:([^;]+)", text)
+    if m:
+        sock = m.group(1)
+        info["php"] = "8.5" if "85" in sock else "8.3"
+    if info["root"]:
+        rp = Path(info["root"])
+        if (rp / "wp-config.php").exists() or (rp / "wp-admin").exists():
+            info["type"] = "WP"
+        elif (rp / "index.php").exists():
+            idx = (rp / "index.php").read_text()
+            if "CodeIgniter" in idx or "CI_" in idx or "BASEPATH" in idx:
+                info["type"] = "CI"
+    return info
+
+
+def get_all_sites() -> list:
+    sites = []
+    if not SITES_AVAILABLE.exists():
+        return sites
+    for f in sorted(SITES_AVAILABLE.glob("*.conf")):
+        sites.append(get_site_info(f.stem))
+    return sites
+
+
+def get_service_status() -> list:
+    php_svc = os.environ.get("SITES_PHP_SVC", "php8.3-fpm")
+    php_sock = os.environ.get("SITES_PHP_SOCK", "/run/php/php8.3-fpm.sock")
+    services = [
+        ("nginx", "Port 80/443"),
+        ("mariadb", "Port 3306"),
+        (php_svc, f"Socket {php_sock}"),
+    ]
+    php85_path = Path("/etc/systemd/system/php8.5-fpm.service")
+    if php85_path.exists():
+        services.append(("php8.5-fpm", "Socket /tmp/phpwebstudy-php-cgi-85.sock"))
+
+    result = []
+    for name, info in services:
+        out, _, rc = run(["systemctl", "is-active", name])
+        status = out.strip() if out else "inactive"
+        result.append({"name": name, "status": status, "info": info})
+    return result
+
+
+def site_http_check(name: str) -> int:
+    out, _, _ = run(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "5", f"http://{name}/"])
+    try:
+        return int(out)
+    except ValueError:
+        return 0
+
+
+# ============= CLI (Typer + Rich) =============
+def cli_list():
+    from rich.console import Console
+    from rich.table import Table
+    from rich import box
+
+    console = Console()
+    sites = get_all_sites()
+
+    table = Table(box=box.ROUNDED, title="[bold]Sites[/bold]", caption=f"Total: {len(sites)}")
+    table.add_column("Site", style="cyan")
+    table.add_column("Status", style="bold")
+    table.add_column("PHP", style="magenta")
+    table.add_column("Type", style="green")
+    table.add_column("Root")
+
+    for s in sites:
+        status = "[green]ON[/green]" if s["enabled"] else "[red]OFF[/red]"
+        table.add_row(s["name"], status, s["php"], s["type"], s["root"])
+
+    console.print(table)
+
+    svcs = get_service_status()
+    stable = Table(box=box.SIMPLE, title="[bold]Services[/bold]")
+    stable.add_column("Service")
+    stable.add_column("Status", style="bold")
+    stable.add_column("Info")
+    for svc in svcs:
+        if svc["status"] == "active":
+            st = "[green]active[/green]"
+        elif svc["status"] == "failed":
+            st = "[red]failed[/red]"
+        else:
+            st = f"[yellow]{svc['status']}[/yellow]"
+        stable.add_row(svc["name"], st, svc["info"])
+    console.print(stable)
+
+
+def cli_check():
+    from rich.console import Console
+    from rich.table import Table
+    from rich import box
+    from rich.progress import Progress
+
+    console = Console()
+    sites = get_all_sites()
+
+    table = Table(box=box.ROUNDED, title="[bold]HTTP Check[/bold]")
+    table.add_column("Site", style="cyan")
+    table.add_column("HTTP", style="bold")
+    table.add_column("URL")
+
+    with Progress() as progress:
+        task = progress.add_task("Checking...", total=len(sites))
+        for s in sites:
+            if not s["enabled"]:
+                table.add_row(s["name"], "[yellow]OFF[/yellow]", "-")
+            else:
+                code = site_http_check(s["name"])
+                if code == 200 or code == 301 or code == 302:
+                    cs = f"[green]{code}[/green]"
+                elif code == 0:
+                    cs = "[red]000[/red]"
+                else:
+                    cs = f"[red]{code}[/red]"
+                table.add_row(s["name"], cs, f"http://{s['domain']}/")
+            progress.update(task, advance=1)
+
+    console.print(table)
+
+
+def cli_services():
+    from rich.console import Console
+    from rich.table import Table
+    from rich import box
+
+    console = Console()
+    svcs = get_service_status()
+    table = Table(box=box.ROUNDED, title="[bold]Services[/bold]")
+    table.add_column("Service", style="cyan")
+    table.add_column("Status", style="bold")
+    table.add_column("Info")
+
+    for svc in svcs:
+        if svc["status"] == "active":
+            st = "[green]active[/green]"
+        elif svc["status"] == "failed":
+            st = "[red]failed[/red]"
+        else:
+            st = f"[yellow]{svc['status']}[/yellow]"
+        table.add_row(svc["name"], st, svc["info"])
+    console.print(table)
+
+
+def cli_enable(name: str):
+    from rich.console import Console
+    console = Console()
+    conf = SITES_AVAILABLE / f"{name}.conf"
+    if not conf.exists():
+        console.print(f"[red]Error:[/red] {name}.conf not found")
+        return
+    link = SITES_ENABLED / f"{name}.conf"
+    if link.exists():
+        console.print(f"[yellow]{name} is already enabled[/yellow]")
+        return
+    _, err, rc = pkexec(["ln", "-sf", str(conf), str(link)])
+    if rc != 0:
+        console.print(f"[red]Error:[/red] {err}")
+        return
+    _, err, rc = pkexec(["nginx", "-s", "reload"])
+    if rc == 0:
+        console.print(f"[green]Enabled {name}[/green]")
+    else:
+        console.print(f"[red]Nginx reload failed:[/red] {err}")
+
+
+def cli_disable(name: str):
+    from rich.console import Console
+    console = Console()
+    link = SITES_ENABLED / f"{name}.conf"
+    if not link.exists():
+        console.print(f"[yellow]{name} is already disabled[/yellow]")
+        return
+    _, err, rc = pkexec(["rm", "-f", str(link)])
+    if rc != 0:
+        console.print(f"[red]Error:[/red] {err}")
+        return
+    _, err, rc = pkexec(["nginx", "-s", "reload"])
+    if rc == 0:
+        console.print(f"[green]Disabled {name}[/green]")
+    else:
+        console.print(f"[red]Nginx reload failed:[/red] {err}")
+
+
+def cli_start():
+    from rich.console import Console
+    console = Console()
+    with console.status("[bold]Starting services..."):
+        pkexec(["systemctl", "start", "mariadb"])
+        pkexec(["systemctl", "start", php_svc()])
+        if Path("/etc/systemd/system/php8.5-fpm.service").exists():
+            pkexec(["systemctl", "start", "php8.5-fpm"])
+        pkexec(["systemctl", "start", "nginx"])
+    console.print("[green]All services started[/green]")
+    cli_services()
+
+
+def cli_stop():
+    from rich.console import Console
+    console = Console()
+    with console.status("[bold]Stopping services..."):
+        pkexec(["systemctl", "stop", "nginx"])
+        pkexec(["systemctl", "stop", php_svc()])
+        if Path("/etc/systemd/system/php8.5-fpm.service").exists():
+            pkexec(["systemctl", "stop", "php8.5-fpm"])
+        pkexec(["systemctl", "stop", "mariadb"])
+    console.print("[yellow]All services stopped[/yellow]")
+    cli_services()
+
+
+def cli_restart(target: Optional[str] = None):
+    from rich.console import Console
+    console = Console()
+    if target:
+        console.print(f"[bold]Restarting {target}...[/bold]")
+        pkexec(["systemctl", "reload", "nginx"])
+        pkexec(["systemctl", "reload", php_svc()])
+        console.print(f"[green]{target} restarted[/green]")
+    else:
+        with console.status("[bold]Restarting all services..."):
+            pkexec(["systemctl", "restart", "mariadb"])
+            pkexec(["systemctl", "restart", php_svc()])
+            if Path("/etc/systemd/system/php8.5-fpm.service").exists():
+                pkexec(["systemctl", "restart", "php8.5-fpm"])
+            pkexec(["systemctl", "restart", "nginx"])
+        console.print("[green]All services restarted[/green]")
+        cli_services()
+
+
+# ============= Site Creation =============
+def cli_create(domain: str, wp: bool = False):
+    """Create a new site using newsite script"""
+    import subprocess as sp
+    from rich.console import Console
+    console = Console()
+
+    newsite = Path.home() / ".local/bin/newsite"
+    if not newsite.exists():
+        console.print("[red]Error:[/red] newsite script not found")
+        return
+
+    cmd = [str(newsite), domain]
+    if wp:
+        cmd.append("--wp")
+
+    with console.status(f"[bold]Creating {domain}..."):
+        result = sp.run(cmd, capture_output=True, text=True, timeout=120)
+
+    if result.returncode == 0:
+        console.print(f"[green]✓ {domain} created successfully![/green]")
+        if result.stdout:
+            console.print(result.stdout)
+    else:
+        console.print(f"[red]Error:[/red] {result.stderr or result.stdout}")
+
+
+# ============= Helpers =============
+def get_wp_config(path: Path) -> Optional[dict]:
+    wp = path / "wp-config.php"
+    if not wp.exists():
+        return None
+    text = wp.read_text()
+    info = {}
+    m = re.search(r"define\(\s*'DB_NAME',\s*'([^']+)'\s*\)", text)
+    if m: info["db_name"] = m.group(1)
+    m = re.search(r"define\(\s*'DB_USER',\s*'([^']+)'\s*\)", text)
+    if m: info["db_user"] = m.group(1)
+    m = re.search(r"define\(\s*'DB_PASSWORD',\s*'([^']+)'\s*\)", text)
+    if m: info["db_pass"] = m.group(1)
+    return info if info.get("db_name") else None
+
+
+def is_wp(path: Path) -> bool:
+    return (path / "wp-config.php").exists() or (path / "wp-admin").exists()
+
+
+def db_dump(db_name: str, db_user: str, db_pass: str, out: Path):
+    env = os.environ.copy()
+    env["MYSQL_PWD"] = db_pass
+    subprocess.run(
+        ["mysqldump", "-u", db_user, "--no-tablespaces", db_name],
+        stdout=out.open("w"), env=env, check=True, timeout=120,
+    )
+
+
+def db_import(db_name: str, db_user: str, db_pass: str, sql: Path):
+    env = os.environ.copy()
+    env["MYSQL_PWD"] = db_pass
+    subprocess.run(
+        ["mysql", "-u", db_user, db_name],
+        stdin=sql.open(), env=env, check=True, timeout=300,
+    )
+
+
+def get_site_root(name: str) -> Optional[Path]:
+    info = get_site_info(name)
+    if info["root"]:
+        return Path(info["root"])
+    return None
+
+
+def ensure_backup_dir(site: str) -> Path:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    p = BACKUP_DIR / site / ts
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def backup_site(site: str, dest: Optional[Path] = None) -> Optional[Path]:
+    root = get_site_root(site)
+    if not root or not root.exists():
+        return None
+    if dest is None:
+        dest = ensure_backup_dir(site)
+
+    meta = {"site": site, "date": datetime.now().isoformat(), "type": "site", "files": [], "db": None}
+
+    # Archive files
+    files_tar = dest / "files.tar.gz"
+    subprocess.run(
+        ["tar", "czf", str(files_tar), "-C", str(root), "--transform", "s|^\\.|htdocs|", "."],
+        check=True, timeout=120,
+    )
+    meta["files"].append("files.tar.gz")
+
+    # DB dump if WordPress
+    if is_wp(root):
+        wp = get_wp_config(root)
+        if wp:
+            db_sql = dest / "database.sql"
+            try:
+                db_dump(wp["db_name"], wp["db_user"], wp["db_pass"], db_sql)
+                meta["db"] = "database.sql"
+                meta["type"] = "WP"
+            except Exception:
+                pass
+
+    json.dump(meta, open(dest / "backup.json", "w"), indent=2)
+    return dest
+
+
+def restore_site(site: str, backup_path: Path):
+    root = get_site_root(site)
+    if not root:
+        # Try to create the directory
+        root = WEBROOT / site
+        root.mkdir(parents=True, exist_ok=True)
+
+    meta_file = backup_path / "backup.json"
+    meta = json.load(open(meta_file)) if meta_file.exists() else {}
+
+    # Extract files
+    files_tar = backup_path / "files.tar.gz"
+    if files_tar.exists():
+        if root.exists():
+            shutil.rmtree(root)
+        root.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["tar", "xzf", str(files_tar), "-C", str(root)],
+            check=True, timeout=120,
+        )
+
+    # Import DB
+    db_sql = backup_path / "database.sql"
+    if db_sql.exists():
+        wp = get_wp_config(root)
+        if wp:
+            try:
+                db_import(wp["db_name"], wp["db_user"], wp["db_pass"], db_sql)
+            except Exception:
+                pass
+
+    # Fix permissions
+    subprocess.run(["chmod", "-R", "a+rX", str(root)], check=False, timeout=30)
+
+
+# ============= Operations =============
+def cli_backup(site: str):
+    from rich.console import Console
+    console = Console()
+
+    info = get_site_info(site)
+    if not info["root"]:
+        console.print(f"[red]Error:[/red] site '{site}' not found")
+        return
+
+    with console.status(f"[bold]Backing up {site}..."):
+        dest = backup_site(site)
+
+    if dest:
+        size = sum(f.stat().st_size for f in dest.rglob("*") if f.is_file())
+        console.print(f"[green]✓ Backup saved:[/green] {dest}")
+        console.print(f"  Size: {size / 1024 / 1024:.1f} MB")
+    else:
+        console.print(f"[red]Error:[/red] backup failed")
+
+
+def cli_restore(site: str, path: str):
+    from rich.console import Console
+    console = Console()
+    bp = Path(path)
+    if not bp.exists():
+        console.print(f"[red]Error:[/red] backup path not found: {path}")
+        return
+
+    with console.status(f"[bold]Restoring {site}..."):
+        restore_site(site, bp)
+    console.print(f"[green]✓ {site} restored from {path}[/green]")
+
+
+def cli_snapshot(site: str):
+    from rich.console import Console
+    console = Console()
+    info = get_site_info(site)
+    if not info["root"]:
+        console.print(f"[red]Error:[/red] site '{site}' not found")
+        return
+
+    snap_dir = BACKUP_DIR / site / "snapshot"
+    if snap_dir.exists():
+        shutil.rmtree(snap_dir)
+    snap_dir.mkdir(parents=True)
+
+    with console.status(f"[bold]Snapshotting {site}..."):
+        dest = backup_site(site, snap_dir)
+
+    if dest:
+        console.print(f"[green]✓ Snapshot saved:[/green] {dest}")
+    else:
+        console.print(f"[red]Error:[/red] snapshot failed")
+
+
+def cli_update_wp(site: str):
+    from rich.console import Console
+    console = Console()
+    root = get_site_root(site)
+    if not root or not is_wp(root):
+        console.print(f"[red]Error:[/red] '{site}' is not a WordPress site")
+        return
+
+    with console.status(f"[bold]Updating WordPress for {site}..."):
+        # Snapshot first
+        snap_dir = BACKUP_DIR / site / "pre-update"
+        if snap_dir.exists():
+            shutil.rmtree(snap_dir)
+        backup_site(site, snap_dir)
+
+        # Download latest WP
+        tmp = Path("/tmp") / f"wp-update-{site}"
+        if tmp.exists():
+            shutil.rmtree(tmp)
+        tmp.mkdir(parents=True)
+        subprocess.run(
+            ["curl", "-sL", "https://wordpress.org/latest.tar.gz", "-o", str(tmp / "wp.tgz")],
+            check=True, timeout=60,
+        )
+        subprocess.run(
+            ["tar", "xzf", str(tmp / "wp.tgz"), "-C", str(tmp)],
+            check=True, timeout=30,
+        )
+
+        # Replace wp-admin and wp-includes
+        for d in ["wp-admin", "wp-includes"]:
+            src = tmp / "wordpress" / d
+            dst = root / d
+            if dst.exists():
+                shutil.rmtree(dst)
+            shutil.copytree(src, dst)
+
+        # Copy new wp-content except existing themes/plugins/uploads
+        wp_content_src = tmp / "wordpress" / "wp-content"
+        wp_content_dst = root / "wp-content"
+        if wp_content_dst.exists():
+            for item in wp_content_src.iterdir():
+                target = wp_content_dst / item.name
+                if not target.exists():
+                    shutil.copytree(item, target) if item.is_dir() else shutil.copy2(item, target)
+        else:
+            shutil.copytree(wp_content_src, wp_content_dst)
+
+        # Cleanup tmp
+        shutil.rmtree(tmp, ignore_errors=True)
+
+        # Run DB upgrade via wp-admin/upgrade.php
+        try:
+            subprocess.run(
+                ["curl", "-s", "-o", "/dev/null", "--max-time", "30",
+                 f"http://{site}/wp-admin/upgrade.php?step=1"],
+                timeout=30,
+            )
+        except Exception:
+            pass
+
+    console.print(f"[green]✓ WordPress updated for {site}[/green]")
+    console.print(f"  Backup saved at: {snap_dir}")
+
+
+def cli_update_all():
+    from rich.console import Console
+    from rich.progress import Progress
+    console = Console()
+    sites = get_all_sites()
+    wp_sites = [s for s in sites if s["type"] == "WP"]
+
+    if not wp_sites:
+        console.print("[yellow]No WordPress sites found[/yellow]")
+        return
+
+    with Progress() as progress:
+        task = progress.add_task("[bold]Updating all WordPress sites...", total=len(wp_sites))
+        for s in wp_sites:
+            progress.update(task, description=f"[bold]Updating {s['name']}...")
+            try:
+                cli_update_wp(s["name"])
+            except Exception as e:
+                console.print(f"[red]Error updating {s['name']}:[/red] {e}")
+            progress.update(task, advance=1)
+
+    console.print("[green]✓ All WordPress sites updated[/green]")
+
+
+def is_local_domain(domain: str) -> bool:
+    return domain.endswith(".test") or domain.endswith(".localhost") or domain == "localhost"
+
+def cli_ssl(site: str):
+    from rich.console import Console
+    console = Console()
+    info = get_site_info(site)
+    if not info["root"]:
+        console.print(f"[red]Error:[/red] site '{site}' not found")
+        return
+
+    if is_local_domain(site):
+        cert_path = Path.home() / f"{site}.pem"
+        key_path = Path.home() / f"{site}-key.pem"
+        with console.status(f"[bold]Generating local SSL for {site} via mkcert..."):
+            out, err, rc = run(["mkcert", site])
+            if rc != 0:
+                console.print(f"[red]mkcert failed:[/red] {err or out}")
+                return
+        # Update Nginx config
+        conf = SITES_AVAILABLE / f"{site}.conf"
+        if conf.exists():
+            text = conf.read_text()
+            ssl_block = (
+                f"    ssl_certificate {cert_path};\n"
+                f"    ssl_certificate_key {key_path};\n"
+                f"    ssl_protocols TLSv1.2 TLSv1.3;\n"
+                f"    ssl_ciphers ECDHE-RSA-AES128-GCM-SHA256:HIGH:!aNULL:!MD5:!RC4:!DHE;\n"
+                f"    ssl_prefer_server_ciphers on;\n"
+                f"    ssl_session_cache shared:SSL:10m;\n"
+                f"    ssl_session_timeout 10m;\n"
+            )
+            if "listen 443 ssl" not in text:
+                text = text.replace("listen 80;", "listen 80;\n    listen 443 ssl http2;", 1)
+            if "ssl_certificate" not in text:
+                # Insert SSL block after the line containing "root "
+                text = re.sub(r"(^    root [^\n]+)", rf"\1\n{ssl_block}", text, count=1, flags=re.MULTILINE)
+            else:
+                text = re.sub(r"ssl_certificate\s+[^;]+;", f"ssl_certificate {cert_path};", text)
+                text = re.sub(r"ssl_certificate_key\s+[^;]+;", f"ssl_certificate_key {key_path};", text)
+            # Write config with sudo
+            import base64
+            b64 = base64.b64encode(text.encode()).decode()
+            run(["bash", "-c", f"echo {b64} | base64 -d | sudo tee {conf} > /dev/null"])
+        # Reload Nginx
+        _, err, rc = pkexec(["nginx", "-s", "reload"])
+        if rc == 0:
+            console.print(f"[green]✓ SSL enabled for https://{site} (mkcert)[/green]")
+        else:
+            console.print(f"[red]Nginx reload failed:[/red] {err}")
+    else:
+        with console.status(f"[bold]Obtaining SSL for {site} via certbot..."):
+            out, err, rc = pkexec(["certbot", "--nginx", "-d", site, "--non-interactive",
+                                   "--agree-tos", "--email", "admin@localhost", "--redirect"])
+        if rc == 0:
+            console.print(f"[green]✓ SSL obtained for https://{site}[/green]")
+        else:
+            console.print(f"[red]SSL failed:[/red] {err or out}")
+            console.print("[yellow]Make sure the domain points to this server and port 80/443 are accessible[/yellow]")
+
+
+def cli_export(site: str):
+    from rich.console import Console
+    console = Console()
+    root = get_site_root(site)
+    if not root or not root.exists():
+        console.print(f"[red]Error:[/red] site '{site}' not found")
+        return
+
+    export_dir = Path("/tmp") / f"export-{site}"
+    if export_dir.exists():
+        shutil.rmtree(export_dir)
+    export_dir.mkdir(parents=True)
+
+    with console.status(f"[bold]Exporting {site}..."):
+        # Backup to export dir
+        backup_site(site, export_dir)
+
+        # Copy nginx config
+        conf = SITES_AVAILABLE / f"{site}.conf"
+        if conf.exists():
+            shutil.copy(conf, export_dir / "nginx.conf")
+
+        # Create export info
+        meta = {"site": site, "export_date": datetime.now().isoformat(),
+                "instructions": "Import: sites restore SITE /path/to/backup"}
+        json.dump(meta, open(export_dir / "export.json", "w"), indent=2)
+
+        # Package everything
+        pkg = Path("/tmp") / f"{site}-export.tar.gz"
+        subprocess.run(
+            ["tar", "czf", str(pkg), "-C", str(export_dir), "."],
+            check=True, timeout=60,
+        )
+
+    size = pkg.stat().st_size / 1024 / 1024
+    console.print(f"[green]✓ Exported:[/green] {pkg} ({size:.1f} MB)")
+    console.print(f"  To import: [bold]sites restore {site} {export_dir}[/bold]")
+    shutil.rmtree(export_dir, ignore_errors=True)
+
+
+# ============= TUI Dashboard (Textual) =============
+def run_dashboard():
+    from textual.app import App, ComposeResult
+    from textual.widgets import Header, Footer, Static, DataTable, RichLog, Button, Label, Input
+    from textual.containers import Horizontal, Vertical, VerticalScroll, Container
+    from textual.screen import Screen
+    from textual.reactive import reactive
+    from textual import work
+    from textual.binding import Binding
+    from rich.text import Text
+    from rich.table import Table as RichTable
+    import asyncio
+
+    class CreateDialog(Screen):
+        """Dialog for creating a new site"""
+        CSS = """
+        Screen {
+            background: $surface 60%;
+        }
+        #dialog {
+            width: 50;
+            height: auto;
+            border: thick $primary;
+            background: $surface;
+            padding: 1 2;
+            margin: 5 8;
+        }
+        Input {
+            margin: 1 0;
+        }
+        .actions {
+            height: 3;
+            content-align: center middle;
+        }
+        Button {
+            margin: 0 1;
+        }
+        """
+
+        def compose(self):
+            with Vertical(id="dialog"):
+                yield Static("[bold]Create New Site[/bold]", id="title")
+                yield Label("Domain name:")
+                yield Input(placeholder="e.g. mydomain.test", id="domain-input")
+                yield Label("Type:")
+                yield Horizontal(
+                    Button("   Plain Site   ", id="create-plain", variant="default"),
+                    Button("   WordPress   ", id="create-wp", variant="primary"),
+                )
+
+        def on_button_pressed(self, event):
+            domain = self.query_one("#domain-input", Input).value.strip()
+            if not domain:
+                self.query_one("#domain-input", Input).focus()
+                return
+            if event.button.id == "create-plain":
+                self.dismiss((domain, False))
+            elif event.button.id == "create-wp":
+                self.dismiss((domain, True))
+
+    class SiteActionsDialog(Screen):
+        """Dialog for site actions"""
+        CSS = """
+        Screen {
+            background: $surface 60%;
+        }
+        #dialog {
+            width: 56;
+            height: auto;
+            border: thick $primary;
+            background: $surface;
+            padding: 1 2;
+            margin: 2 6;
+        }
+        #title {
+            text-style: bold;
+            padding: 0 0 1 0;
+        }
+        #wp-only {
+            color: $text-muted;
+            padding: 0 0 1 0;
+        }
+        .actions-grid {
+            height: auto;
+            max-height: 22;
+        }
+        Button {
+            margin: 0 1;
+            min-width: 22;
+        }
+        .bottom-row {
+            height: 3;
+            content-align: center middle;
+        }
+        """
+
+        def __init__(self, site: str, is_wp: bool):
+            super().__init__()
+            self.site = site
+            self.is_wp = is_wp
+
+        def compose(self):
+            with Vertical(id="dialog"):
+                yield Static(f"[bold]Site: {self.site}[/bold]", id="title")
+                with VerticalScroll(classes="actions-grid"):
+                    yield Button("📦 Backup", id="act-backup", variant="primary")
+                    yield Button("📸 Snapshot", id="act-snapshot", variant="default")
+                    yield Button("📋 Restore", id="act-restore", variant="default")
+                    if self.is_wp:
+                        yield Button("🔄 Update WordPress", id="act-update-wp", variant="warning")
+                    yield Button("🔒 SSL (certbot)", id="act-ssl", variant="default")
+                    yield Button("📤 Export", id="act-export", variant="default")
+                if self.is_wp:
+                    yield Static("[dim]WordPress detected — update available[/dim]", id="wp-only")
+                yield Horizontal(
+                    Button("✕ Close", id="act-close", variant="error"),
+                    classes="bottom-row",
+                )
+
+        def on_button_pressed(self, event):
+            mapping = {
+                "act-backup": "backup",
+                "act-snapshot": "snapshot",
+                "act-restore": "restore",
+                "act-update-wp": "update-wp",
+                "act-ssl": "ssl",
+                "act-export": "export",
+            }
+            action = mapping.get(event.button.id)
+            if action:
+                self.dismiss(action)
+            elif event.button.id == "act-close":
+                self.dismiss(None)
+
+    class SitesApp(App):
+        TITLE = "Sites Dashboard"
+        CSS = """
+        Screen {
+            background: $surface;
+        }
+
+        .services-box {
+            height: 5;
+            border: solid $primary;
+            margin: 0 1;
+            padding: 0 1;
+        }
+
+        .services-box Static {
+            padding: 0 1;
+        }
+
+        .services-row {
+            height: 1;
+        }
+
+        .title-bar {
+            height: 3;
+            content-align: center middle;
+            text-style: bold;
+            background: $primary;
+            color: $text;
+        }
+
+        DataTable {
+            height: 1fr;
+            margin: 0 1;
+            border: solid $secondary;
+        }
+
+        DataTable > .datatable--header {
+            background: $secondary;
+            color: $text;
+            text-style: bold;
+        }
+
+        .status-bar {
+            height: 3;
+            margin: 0 1;
+            padding: 0 1;
+            background: $boost;
+        }
+
+        .actions {
+            height: 3;
+            margin: 0 1;
+            dock: bottom;
+        }
+
+        Button {
+            margin: 0 1;
+        }
+
+        Button:hover {
+            text-style: bold;
+        }
+
+        #refresh-label {
+            padding: 0 1;
+            height: 1;
+            text-align: right;
+            color: $text-muted;
+        }
+        """
+
+        def compose(self):
+            yield Header()
+            yield Container(
+                Static("[bold]Services[/bold]", id="svc-title"),
+                Static(id="svc-status", classes="services-box"),
+                Static("[bold]Sites[/bold]", id="sites-title"),
+                DataTable(id="sites-table"),
+                Static(id="refresh-label"),
+                Horizontal(
+                    Button("↻ Refresh", id="refresh", variant="primary"),
+                    Button("✓ Check", id="check", variant="default"),
+                    Button("▶ Start All", id="start", variant="success"),
+                    Button("■ Stop All", id="stop", variant="error"),
+                    Button("⟳ Restart", id="restart", variant="warning"),
+                    Button("🔌 Toggle", id="toggle", variant="default"),
+                    Button("⚙ Actions", id="actions", variant="default"),
+                    Button("➕ Create", id="create", variant="primary"),
+                    classes="actions",
+                ),
+            )
+            yield Footer()
+
+        def on_mount(self):
+            self.refresh_count = 0
+            table = self.query_one("#sites-table", DataTable)
+            table.add_columns("Site", "Status", "HTTP", "PHP", "Type", "Root")
+            self.refresh_all()
+
+        def refresh_all(self):
+            self.refresh_count += 1
+            self.update_services()
+            self.update_sites()
+            self.query_one("#refresh-label", Static).update(
+                f"[dim]refreshed: {time.strftime('%H:%M:%S')}[/dim]"
+            )
+
+        def update_services(self):
+            svcs = get_service_status()
+            text = Text()
+            for i, svc in enumerate(svcs):
+                if i > 0:
+                    text.append("   │   ")
+                dot = "●" if svc["status"] == "active" else "○"
+                color = "green" if svc["status"] == "active" else "red" if svc["status"] == "failed" else "yellow"
+                text.append(f"{dot} ", style=color)
+                text.append(f"{svc['name']} ", style="bold")
+                text.append(f"[{svc['status']}]", style=color)
+            self.query_one("#svc-status", Static).update(text)
+
+        def update_sites(self):
+            sites = get_all_sites()
+            table = self.query_one("#sites-table", DataTable)
+            table.clear()
+
+            for s in sites:
+                status = "✅ ON" if s["enabled"] else "⛔ OFF"
+                http = "[dim]?[/dim]"
+                type_color = {"WP": "green", "CI": "yellow", "site": "cyan"}
+                stype = f"[{type_color.get(s['type'], 'white')}]{s['type']}[/{type_color.get(s['type'], 'white')}]"
+
+                root = s["root"].replace(str(WEBROOT) + "/", "") if s["root"] else "-"
+                status_text = Text.from_markup(status)
+                http_text = Text.from_markup(http)
+                type_text = Text.from_markup(stype)
+                table.add_row(s["name"], status_text, http_text, s["php"], type_text, root)
+
+        @work
+        async def action_toggle(self):
+            table = self.query_one("#sites-table", DataTable)
+            row_key, col = table.cursor_coordinate
+            if row_key is None:
+                return
+            site = table.get_row_at(row_key)[0]
+            info = get_site_info(site)
+            if info["enabled"]:
+                cli_disable(site)
+            else:
+                cli_enable(site)
+            self.refresh_all()
+
+        @work
+        async def action_refresh(self):
+            self.refresh_all()
+
+        @work
+        async def action_check(self):
+            table = self.query_one("#sites-table", DataTable)
+            sites = get_all_sites()
+            sites_data = [(s["name"], s["enabled"]) for s in sites]
+            table.clear()
+            for name, enabled in sites_data:
+                status = "✅ ON" if enabled else "⛔ OFF"
+                if enabled:
+                    code = site_http_check(name)
+                    if code == 200 or code == 301 or code == 302:
+                        http = f"[green]{code}[/green]"
+                    elif code == 0:
+                        http = "[red]ERR[/red]"
+                    else:
+                        http = f"[red]{code}[/red]"
+                else:
+                    http = "-"
+                info = get_site_info(name)
+                root = info["root"].replace(str(WEBROOT) + "/", "") if info["root"] else "-"
+                type_color = {"WP": "green", "CI": "yellow", "site": "cyan"}
+                stype = f"[{type_color.get(info['type'], 'white')}]{info['type']}[/{type_color.get(info['type'], 'white')}]"
+                status_text = Text.from_markup(status)
+                http_text = Text.from_markup(http)
+                type_text = Text.from_markup(stype)
+                table.add_row(name, status_text, http_text, info["php"], type_text, root)
+            self.refresh_all()
+
+        @work
+        async def action_start(self):
+            cli_start()
+            self.refresh_all()
+
+        @work
+        async def action_stop(self):
+            cli_stop()
+            self.refresh_all()
+
+        @work
+        async def action_restart(self):
+            cli_restart()
+            self.refresh_all()
+
+        @work
+        async def action_create(self):
+            dialog = CreateDialog()
+            result = await self.push_screen_wait(dialog)
+            if result:
+                domain, wp = result
+                cli_create(domain, wp)
+                self.refresh_all()
+
+        @work
+        async def action_actions(self):
+            table = self.query_one("#sites-table", DataTable)
+            row_key, col = table.cursor_coordinate
+            if row_key is None:
+                return
+            site = table.get_row_at(row_key)[0]
+            info = get_site_info(site)
+            is_wp = info["type"] == "WP"
+            dialog = SiteActionsDialog(site, is_wp)
+            action = await self.push_screen_wait(dialog)
+            if not action:
+                return
+            if action == "backup":
+                cli_backup(site)
+            elif action == "snapshot":
+                cli_snapshot(site)
+            elif action == "restore":
+                site_dir = BACKUP_DIR / site
+                if not site_dir.exists():
+                    console.log(f"[red]No backups found for {site}[/red]")
+                    return
+                backups = sorted(site_dir.iterdir(), key=lambda p: p.name, reverse=True) if site_dir.exists() else []
+                class RestoreDialog(Screen):
+                    CSS = """
+                    Screen { background: $surface 60%; }
+                    #dialog { width: 68; height: auto; border: thick $primary; background: $surface; padding: 1 2; margin: 3 6; }
+                    #list { height: 12; }
+                    Button { margin: 0 1; }
+                    """
+                    def compose(self):
+                        with Vertical(id="dialog"):
+                            yield Static(f"[bold]Restore {site} — select backup:[/bold]")
+                            with VerticalScroll(id="list"):
+                                for b in backups:
+                                    label = b.name
+                                    extra = ""
+                                    meta_file = b / "backup.json"
+                                    if meta_file.exists():
+                                        try:
+                                            meta = json.loads(meta_file.read_text())
+                                            extra = f" ({meta.get('type', 'site')})"
+                                        except Exception:
+                                            pass
+                                    yield Button(f"  {label}{extra}", id=f"bkp-{label}", variant="default")
+                            yield Horizontal(
+                                Button("✕ Cancel", id="cancel", variant="error"),
+                                classes="bottom-row",
+                            )
+                    def on_button_pressed(self, ev):
+                        if ev.button.id.startswith("bkp-"):
+                            label = ev.button.id[4:]
+                            self.dismiss(str(site_dir / label))
+                        else:
+                            self.dismiss(None)
+                bp = await self.push_screen_wait(RestoreDialog())
+                if bp:
+                    cli_restore(site, bp)
+            elif action == "update-wp":
+                cli_update_wp(site)
+            elif action == "ssl":
+                cli_ssl(site)
+            elif action == "export":
+                cli_export(site)
+            self.refresh_all()
+
+        async def on_button_pressed(self, event):
+            btn_id = event.button.id
+            if btn_id == "refresh":
+                self.action_refresh()
+            elif btn_id == "check":
+                self.action_check()
+            elif btn_id == "start":
+                self.action_start()
+            elif btn_id == "stop":
+                self.action_stop()
+            elif btn_id == "restart":
+                self.action_restart()
+            elif btn_id == "toggle":
+                self.action_toggle()
+            elif btn_id == "actions":
+                self.action_actions()
+            elif btn_id == "create":
+                self.action_create()
+
+    SitesApp().run()
+
+
+# ============= Main Entry =============
+def main():
+    import typer
+    app = typer.Typer(
+        name="sites",
+        help="Website & Service Manager",
+        rich_markup_mode="rich",
+        no_args_is_help=True,
+    )
+
+    @app.command()
+    def list():
+        """List all sites with status"""
+        cli_list()
+
+    @app.command()
+    def check():
+        """HTTP check all enabled sites"""
+        cli_check()
+
+    @app.command()
+    def services():
+        """Show service status"""
+        cli_services()
+
+    @app.command()
+    def enable(name: str = typer.Argument(..., help="Site name")):
+        """Enable a site"""
+        cli_enable(name)
+
+    @app.command()
+    def disable(name: str = typer.Argument(..., help="Site name")):
+        """Disable a site"""
+        cli_disable(name)
+
+    @app.command()
+    def start():
+        """Start all services"""
+        cli_start()
+
+    @app.command()
+    def stop():
+        """Stop all services"""
+        cli_stop()
+
+    @app.command()
+    def restart(
+        name: Optional[str] = typer.Argument(None, help="Site name (optional)")):
+        """Restart services or a specific site"""
+        cli_restart(name)
+
+    @app.command()
+    def create(
+        domain: str = typer.Argument(..., help="Domain name (e.g. mydomain.test)"),
+        wp: bool = typer.Option(False, "--wp", help="Install WordPress"),
+    ):
+        """Create a new site"""
+        cli_create(domain, wp)
+
+    @app.command()
+    def backup(site: str = typer.Argument(..., help="Site name")):
+        """Backup a site"""
+        cli_backup(site)
+
+    @app.command()
+    def restore(
+        site: str = typer.Argument(..., help="Site name"),
+        path: str = typer.Argument(..., help="Backup path"),
+    ):
+        """Restore a site from backup"""
+        cli_restore(site, path)
+
+    @app.command()
+    def snapshot(site: str = typer.Argument(..., help="Site name")):
+        """Quick snapshot of a site"""
+        cli_snapshot(site)
+
+    @app.command()
+    def update_wordpress(site: str = typer.Argument(..., help="Site name")):
+        """Update WordPress for a site"""
+        cli_update_wp(site)
+
+    @app.command()
+    def update_all():
+        """Update all WordPress sites"""
+        cli_update_all()
+
+    @app.command()
+    def ssl(site: str = typer.Argument(..., help="Site name")):
+        """Obtain SSL certificate via certbot"""
+        cli_ssl(site)
+
+    @app.command()
+    def export(site: str = typer.Argument(..., help="Site name")):
+        """Export a site for transfer"""
+        cli_export(site)
+
+    @app.command()
+    def dashboard():
+        """Interactive TUI dashboard"""
+        run_dashboard()
+
+    app()
+
+
+if __name__ == "__main__":
+    main()
