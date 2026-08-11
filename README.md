@@ -118,3 +118,126 @@ sites-dashboard/
 │   └── newsite     # مساعد إنشاء المواقع
 └── README.md
 ```
+
+---
+
+# Sites Dashboard 🚀 (English)
+
+Local web server manager: start/stop services, create sites, backup/restore,
+SSL, an interactive TUI dashboard, and full CLI commands.
+
+Stack: **Nginx + PHP-FPM + MariaDB + WordPress** (optional).
+
+---
+
+## ⚡ Quick Install (1 minute)
+
+### Option 1: .deb package (easiest)
+```bash
+# Download the latest release, then:
+sudo apt install ./sites-dashboard_1.0.0_all.deb
+```
+
+### Option 2: Script
+```bash
+git clone https://github.com/touficmamdouh/sites-dashboard.git
+cd sites-dashboard
+./install.sh
+```
+
+### Option 3: Build from source + install
+```bash
+git clone https://github.com/touficmamdouh/sites-dashboard.git
+cd sites-dashboard
+./build.sh          # produces sites-dashboard_1.0.0_all.deb
+sudo apt install ./sites-dashboard_1.0.0_all.deb
+```
+
+Either way, the script/package **auto-installs any missing dependency**:
+- `python3`, `pip`
+- Python libraries: `typer rich textual`
+- `nginx`, `mariadb`, `php-fpm`, `certbot`, `mkcert`
+- Enables services and configures the `sites` environment automatically
+
+After install:
+```bash
+source ~/.bashrc
+sites dashboard     # interactive dashboard
+```
+
+---
+
+## 📁 Configuration (optional)
+
+Everything is set via environment variables (defaults auto-detected):
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `SITES_WEBROOT` | Sites directory | `~/www` |
+| `SITES_BACKUP` | Backup directory | `~/backups` |
+| `SITES_PHP_SOCK` | PHP-FPM socket | auto-detected |
+| `SITES_DB_ROOT_USER` / `SITES_DB_ROOT_PASS` | MySQL admin (for creating DBs) | root / root |
+| `NGINX_AVAILABLE` / `NGINX_ENABLED` | Nginx dirs | `/etc/nginx/sites-available` / `-enabled` |
+
+Example:
+```bash
+export SITES_WEBROOT=/home/me/www
+export SITES_DB_ROOT_PASS="secret"
+```
+
+> **Note:** If `sudo` requires a password it will prompt once. For passwordless runs:
+> ```
+> sudo visudo
+> # add this line (replace USER with your name):
+> USER ALL=(ALL) NOPASSWD: ALL
+> ```
+
+---
+
+## 🖥️ Commands
+
+### Interactive dashboard
+```bash
+sites dashboard
+```
+Buttons: enable/disable/start/stop/restart services, HTTP check, create site,
+backup, snapshot, restore, WordPress update, SSL, export.
+
+### CLI
+```bash
+sites list                  # list sites + service status
+sites services              # service status only
+sites check                 # HTTP check for all sites
+sites start | stop | restart [name]
+sites create mydomain.test [--wp]   # create site (+ WordPress)
+sites enable mydomain.test | disable mydomain.test
+sites backup mydomain.test          # backup (files + database)
+sites restore mydomain.test ~/backups/mydomain.test/20260101_120000
+sites snapshot mydomain.test        # quick snapshot
+sites update_wordpress mydomain.test | update_all
+sites ssl mydomain.test             # SSL (certbot for real domains / mkcert for .test)
+sites export mydomain.test          # export archive for transfer
+```
+
+---
+
+## 🧱 Manual requirements (if you prefer doing it yourself)
+```bash
+sudo apt update
+sudo apt install -y nginx mariadb-server php-fpm python3-pip certbot python3-certbot-nginx
+python3 -m pip install typer rich textual
+```
+
+---
+
+## 📂 Project layout
+```
+sites-dashboard/
+├── install.sh      # installer (auto-installs missing deps)
+├── build.sh        # builds the .deb
+├── DEBIAN/         # package files (control / postinst / prerm)
+├── bin/
+│   ├── sites       # main tool (Python CLI + TUI)
+│   └── newsite     # site creation helper
+└── README.md
+```
