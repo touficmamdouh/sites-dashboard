@@ -15,10 +15,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, List
 
-SITES_AVAILABLE = Path(os.environ.get("NGINX_AVAILABLE", "/etc/nginx/sites-available"))
-SITES_ENABLED = Path(os.environ.get("NGINX_ENABLED", "/etc/nginx/sites-enabled"))
-WEBROOT = Path(os.environ.get("SITES_WEBROOT", str(Path.home() / "www")))
-BACKUP_DIR = Path(os.environ.get("SITES_BACKUP", str(Path.home() / "backups")))
+SITES_AVAILABLE = Path("/etc/nginx/sites-available")
+SITES_ENABLED = Path("/etc/nginx/sites-enabled")
+WEBROOT = Path("/home/t9/www")
+BACKUP_DIR = Path("/home/t9/backups")
 
 
 def run(cmd: list, timeout: int = 15) -> tuple[str, str, int]:
@@ -32,14 +32,7 @@ def run(cmd: list, timeout: int = 15) -> tuple[str, str, int]:
 
 
 def pkexec(cmd: list) -> tuple[str, str, int]:
-    r = run(["sudo", "-n"] + cmd)
-    if r[2] != 0:
-        r = run(["sudo"] + cmd, timeout=60)
-    return r
-
-
-def php_svc() -> str:
-    return os.environ.get("SITES_PHP_SVC", "php8.3-fpm")
+    return run(["sudo", "-n"] + cmd)
 
 
 def get_site_info(name: str) -> dict:
@@ -78,12 +71,11 @@ def get_all_sites() -> list:
 
 
 def get_service_status() -> list:
-    php_svc = os.environ.get("SITES_PHP_SVC", "php8.3-fpm")
-    php_sock = os.environ.get("SITES_PHP_SOCK", "/run/php/php8.3-fpm.sock")
     services = [
         ("nginx", "Port 80/443"),
+        ("mailpit", "UI http://127.0.0.1:8025"),
         ("mariadb", "Port 3306"),
-        (php_svc, f"Socket {php_sock}"),
+        ("php8.3-fpm", "Socket /run/php/php8.3-fpm.sock"),
     ]
     php85_path = Path("/etc/systemd/system/php8.5-fpm.service")
     if php85_path.exists():
@@ -244,7 +236,8 @@ def cli_start():
     console = Console()
     with console.status("[bold]Starting services..."):
         pkexec(["systemctl", "start", "mariadb"])
-        pkexec(["systemctl", "start", php_svc()])
+        pkexec(["systemctl", "start", "mailpit"])
+        pkexec(["systemctl", "start", "php8.3-fpm"])
         if Path("/etc/systemd/system/php8.5-fpm.service").exists():
             pkexec(["systemctl", "start", "php8.5-fpm"])
         pkexec(["systemctl", "start", "nginx"])
@@ -257,9 +250,10 @@ def cli_stop():
     console = Console()
     with console.status("[bold]Stopping services..."):
         pkexec(["systemctl", "stop", "nginx"])
-        pkexec(["systemctl", "stop", php_svc()])
+        pkexec(["systemctl", "stop", "php8.3-fpm"])
         if Path("/etc/systemd/system/php8.5-fpm.service").exists():
             pkexec(["systemctl", "stop", "php8.5-fpm"])
+        pkexec(["systemctl", "stop", "mailpit"])
         pkexec(["systemctl", "stop", "mariadb"])
     console.print("[yellow]All services stopped[/yellow]")
     cli_services()
@@ -271,12 +265,13 @@ def cli_restart(target: Optional[str] = None):
     if target:
         console.print(f"[bold]Restarting {target}...[/bold]")
         pkexec(["systemctl", "reload", "nginx"])
-        pkexec(["systemctl", "reload", php_svc()])
+        pkexec(["systemctl", "reload", "php8.3-fpm"])
         console.print(f"[green]{target} restarted[/green]")
     else:
         with console.status("[bold]Restarting all services..."):
             pkexec(["systemctl", "restart", "mariadb"])
-            pkexec(["systemctl", "restart", php_svc()])
+            pkexec(["systemctl", "restart", "mailpit"])
+            pkexec(["systemctl", "restart", "php8.3-fpm"])
             if Path("/etc/systemd/system/php8.5-fpm.service").exists():
                 pkexec(["systemctl", "restart", "php8.5-fpm"])
             pkexec(["systemctl", "restart", "nginx"])

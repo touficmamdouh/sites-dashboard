@@ -61,6 +61,55 @@ main() {
         rm -f /tmp/mkcert
     fi
 
+    # --- mailpit (local mail) ----------------------------------
+    if [ -z "$(need mailpit)" ]; then
+        echo -e "${GREEN}  ✓ mailpit already installed${NC}"
+    else
+        echo -e "${YELLOW}  installing mailpit (local mail catcher)...${NC}"
+        curl -sSL -o /tmp/mailpit.tar.gz \
+            "https://github.com/axllent/mailpit/releases/download/v1.30.7/mailpit-linux-amd64.tar.gz"
+        tar xzf /tmp/mailpit.tar.gz -C /tmp
+        sudo install -m 755 /tmp/mailpit /usr/local/bin/mailpit
+        rm -f /tmp/mailpit.tar.gz /tmp/mailpit
+    fi
+
+    # system sendmail wrapper (PHP *-> sendmail -> Mailpit)
+    if ! command -v msmtp >/dev/null 2>&1 || ! [ -x /usr/sbin/sendmail ]; then
+        echo -e "${YELLOW}  installing msmtp-mta (sendmail relay)...${NC}"
+        sudo apt-get install -y msmtp-mta
+    fi
+    sudo tee /etc/msmtprc >/dev/null <<'MSMTP'
+defaults
+auth off
+tls off
+
+account local
+host 127.0.0.1
+port 1025
+from noreply@localhost
+
+account default : local
+MSMTP
+    sudo chmod 644 /etc/msmtprc
+
+    # mailpit systemd service
+    if ! systemctl list-unit-files 2>/dev/null | grep -q '^mailpit'; then
+        sudo tee /etc/systemd/system/mailpit.service >/dev/null <<'MAILPIT'
+[Unit]
+Description=Mailpit local mail server
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/mailpit --smtp 127.0.0.1:1025 --listen 127.0.0.1:8025
+Restart=unless-stopped
+
+[Install]
+WantedBy=multi-user.target
+MAILPIT
+        sudo systemctl daemon-reload
+        sudo systemctl enable --now mailpit >/dev/null 2>&1 || true
+    fi
+
     # --- determine runtime certs -------------------------------
     PHP_SOCK=$(detect_php)
     PHP_VER=$(basename "$(dirname "$PHP_SOCK")")   # e.g. php8.3
@@ -88,6 +137,7 @@ main() {
     echo -e "${YELLOW}  enabling services...${NC}"
     sudo systemctl enable --now nginx >/dev/null 2>&1 || true
     sudo systemctl enable --now mariadb >/dev/null 2>&1 || true
+    sudo systemctl enable --now mailpit >/dev/null 2>&1 || true
     if systemctl list-unit-files 2>/dev/null | grep -q "$PHP_SVC"; then
         sudo systemctl enable --now "$PHP_SVC" >/dev/null 2>&1 || true
     fi
@@ -96,6 +146,7 @@ main() {
     echo -e "${GREEN}✅ Done!${NC}"
     echo -e "   Binaries:   ${YELLOW}$BIN/sites${NC} and ${YELLOW}$BIN/newsite${NC}"
     echo -e "   php socket: ${YELLOW}$PHP_SOCK${NC} (service $PHP_SVC)"
+    echo -e "   mail inbox: ${YELLOW}http://127.0.0.1:8025${NC} (Mailpit)"
     echo ""
     echo -e "   ${BOLD}Run:${NC}"
     echo "     sites dashboard        # interactive TUI"

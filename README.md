@@ -9,10 +9,12 @@
 
 ## ⚡ التثبيت السريع (دقيقة واحدة)
 
+≥ أحدث إصدار: **1.1.0** — يضيف **Mailpit** (صندوق بريد محلي).
+
 ### الطريقة 1: باكج .deb (الأسهل)
 ```bash
 # أنزّل آخر نسخة من صفحة Releases، ثم:
-sudo apt install ./sites-dashboard_1.0.0_all.deb
+sudo apt install ./sites-dashboard_1.1.0_all.deb
 ```
 
 ### الطريقة 2: السكربت
@@ -34,6 +36,7 @@ sudo apt install ./sites-dashboard_1.0.0_all.deb
 - `python3`, `pip`
 - مكتبات بايثون: `typer rich textual`
 - `nginx`, `mariadb`, `php-fpm`, `certbot`, `mkcert`
+- **Mailpit** (صندوق بريد محلي) + `msmtp-mta` (موجّه `sendmail`) — أي `wp_mail()` من أي موقع محلي يظهر في المتصفح بدون إرسال حقيقي
 - يفعّل الخدمات تلقائياً ويجهّز بيئة `sites`
 
 بعد التثبيت:
@@ -83,7 +86,7 @@ sites dashboard
 ### CLI
 ```bash
 sites list                  # عرض المواقع + حالة الخدمات
-sites services              # حالة الخدمات فقط
+sites services              # حالة الخدمات فقط (يشمل mailpit)
 sites check                 # فحص HTTP لكل المواقع
 sites start | stop | restart [name]
 sites create mydomain.test [--wp]   # إنشاء موقع (+ WordPress)
@@ -94,6 +97,17 @@ sites snapshot mydomain.test        # لقطة سريعة
 sites update_wordpress mydomain.test | update_all
 sites ssl mydomain.test             # SSL (certbot للمواقع الحقيقية / mkcert للـ .test)
 sites export mydomain.test          # تصدير الحزمة للنقل
+```
+
+### 📧 البريد المحلي (Mailpit)
+أي رسالة بريد من أي موقع محلي (`wp_mail()`, PHP `mail()`) تُلتقط محلياً بدل ما تروح للإنترنت:
+- صندوق البريد: **http://127.0.0.1:8025**
+- يعمل مع `php-fpm` (8.3/8.5…) عبر `/usr/sbin/sendmail` → `msmtp` → Mailpit
+- يظهر في `sites list` / `sites services` ويُدار مع `sites start|stop|restart`
+
+مثال:
+```bash
+wp eval 'wp_mail("you@example.com", "Test", "Hello");'   # تظهر في صندوق Mailpit
 ```
 
 ---

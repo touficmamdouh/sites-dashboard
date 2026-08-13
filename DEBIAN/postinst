@@ -26,7 +26,62 @@ done
 # 4. enable services
 systemctl enable nginx >/dev/null 2>&1 || true
 systemctl enable mariadb >/dev/null 2>&1 || true
+systemctl enable mailpit >/dev/null 2>&1 || true
 systemctl enable "$PHP_SVC" >/dev/null 2>&1 || true
+
+# 5. mailpit (local mail catcher)
+install_mailpit() {
+    if command -v mailpit >/dev/null 2>&1; then
+        echo "  ✓ mailpit already installed"
+        return
+    fi
+    echo "  installing mailpit..."
+    if [ -x /usr/local/bin/mailpit ]; then
+        return
+    fi
+    curl -sSL -o /tmp/mailpit.tar.gz \
+        "https://github.com/axllent/mailpit/releases/download/v1.30.7/mailpit-linux-amd64.tar.gz"
+    tar xzf /tmp/mailpit.tar.gz -C /tmp
+    install -m 755 /tmp/mailpit /usr/local/bin/mailpit
+    rm -f /tmp/mailpit.tar.gz /tmp/mailpit
+}
+install_mailpit
+
+# sendmail wrapper -> mailpit
+if ! command -v msmtp >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y msmtp-mta >/dev/null 2>&1 || true
+fi
+tee /etc/msmtprc >/dev/null <<'MSMTP'
+defaults
+auth off
+tls off
+
+account local
+host 127.0.0.1
+port 1025
+from noreply@localhost
+
+account default : local
+MSMTP
+chmod 644 /etc/msmtprc
+
+# mailpit systemd service
+if ! systemctl list-unit-files 2>/dev/null | grep -q '^mailpit'; then
+    tee /etc/systemd/system/mailpit.service >/dev/null <<'MAILPIT'
+[Unit]
+Description=Mailpit local mail server
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/mailpit --smtp 127.0.0.1:1025 --listen 127.0.0.1:8025
+Restart=unless-stopped
+
+[Install]
+WantedBy=multi-user.target
+MAILPIT
+    systemctl daemon-reload
+    systemctl enable --now mailpit >/dev/null 2>&1 || true
+fi
 
 echo ""
 echo "sites-dashboard installed!"
