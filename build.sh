@@ -4,7 +4,7 @@
 set -e
 cd "$(dirname "$0")"
 
-VERSION="${1:-1.0.0}"
+VERSION="${1:-1.2.0}"
 PKGNAME="sites-dashboard_${VERSION}_all.deb"
 
 echo "==> Staging"

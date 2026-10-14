@@ -9,12 +9,13 @@
 
 ## ⚡ التثبيت السريع (دقيقة واحدة)
 
-≥ أحدث إصدار: **1.1.0** — يضيف **Mailpit** (صندوق بريد محلي).
+≥ أحدث إصدار: **1.2.0** — إصلاح تحويل المواقع الجديدة لموقع آخر (IPv6)، أمر `fix_permissions` وإصلاح صلاحيات WordPress، وتحديث WordPress محسّن.
+الإصدار السابق **1.1.0** أضاف **Mailpit** (صندوق بريد محلي).
 
 ### الطريقة 1: باكج .deb (الأسهل)
 ```bash
 # أنزّل آخر نسخة من صفحة Releases، ثم:
-sudo apt install ./sites-dashboard_1.1.0_all.deb
+sudo apt install ./sites-dashboard_1.2.0_all.deb
 ```
 
 ### الطريقة 2: السكربت
@@ -28,8 +29,8 @@ cd sites-dashboard
 ```bash
 git clone https://github.com/touficmamdouh/sites-dashboard.git
 cd sites-dashboard
-./build.sh          # ينتج sites-dashboard_1.0.0_all.deb
-sudo apt install ./sites-dashboard_1.0.0_all.deb
+./build.sh          # ينتج sites-dashboard_1.2.0_all.deb
+sudo apt install ./sites-dashboard_1.2.0_all.deb
 ```
 
 في الحالتين، السكربت/الباكج **ينزّل تلقائياً** أي مكوّن ناقص:
@@ -81,7 +82,7 @@ export SITES_DB_ROOT_PASS="كلمة_السر"
 sites dashboard
 ```
 أزرار: توجيه/فصل/تشغيل/إيقاف/إعادة تشغيل الخدمات، فحص HTTP، إنشاء موقع،
-نسخ احتياطي، لقطة، استعادة، تحديث WordPress، SSL، تصدير.
+نسخ احتياطي، لقطة، استعادة، تحديث WordPress، SSL، تصدير، إصلاح الصلاحيات.
 
 ### CLI
 ```bash
@@ -97,6 +98,7 @@ sites snapshot mydomain.test        # لقطة سريعة
 sites update_wordpress mydomain.test | update_all
 sites ssl mydomain.test             # SSL (certbot للمواقع الحقيقية / mkcert للـ .test)
 sites export mydomain.test          # تصدير الحزمة للنقل
+sites fix_permissions [site]        # إصلاح صلاحيات WordPress (موقع أو الكل)
 ```
 
 ### 📧 البريد المحلي (Mailpit)
@@ -149,7 +151,7 @@ Stack: **Nginx + PHP-FPM + MariaDB + WordPress** (optional).
 ### Option 1: .deb package (easiest)
 ```bash
 # Download the latest release, then:
-sudo apt install ./sites-dashboard_1.0.0_all.deb
+sudo apt install ./sites-dashboard_1.2.0_all.deb
 ```
 
 ### Option 2: Script
@@ -163,8 +165,8 @@ cd sites-dashboard
 ```bash
 git clone https://github.com/touficmamdouh/sites-dashboard.git
 cd sites-dashboard
-./build.sh          # produces sites-dashboard_1.0.0_all.deb
-sudo apt install ./sites-dashboard_1.0.0_all.deb
+./build.sh          # produces sites-dashboard_1.2.0_all.deb
+sudo apt install ./sites-dashboard_1.2.0_all.deb
 ```
 
 Either way, the script/package **auto-installs any missing dependency**:
@@ -215,7 +217,7 @@ export SITES_DB_ROOT_PASS="secret"
 sites dashboard
 ```
 Buttons: enable/disable/start/stop/restart services, HTTP check, create site,
-backup, snapshot, restore, WordPress update, SSL, export.
+backup, snapshot, restore, WordPress update, SSL, export, fix permissions.
 
 ### CLI
 ```bash
@@ -231,6 +233,7 @@ sites snapshot mydomain.test        # quick snapshot
 sites update_wordpress mydomain.test | update_all
 sites ssl mydomain.test             # SSL (certbot for real domains / mkcert for .test)
 sites export mydomain.test          # export archive for transfer
+sites fix_permissions [site]        # fix WordPress permissions (one site or all)
 ```
 
 ---

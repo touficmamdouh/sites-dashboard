@@ -41,6 +41,7 @@ echo -e "${GREEN}[2/7]${NC} Creating Nginx config..."
 sudo -n tee "$NGINX_CONF" > /dev/null << NGINX
 server {
     listen 80;
+    listen [::]:80;
     server_name $DOMAIN;
     root $SITE_DIR;
     index index.php index.html index.htm;

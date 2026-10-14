@@ -19,6 +19,8 @@ SITES_AVAILABLE = Path("/etc/nginx/sites-available")
 SITES_ENABLED = Path("/etc/nginx/sites-enabled")
 WEBROOT = Path("/home/t9/www")
 BACKUP_DIR = Path("/home/t9/backups")
+WP_USER = "www-data"
+WP_GROUP = "www-data"
 
 
 def run(cmd: list, timeout: int = 15) -> tuple[str, str, int]:
@@ -302,6 +304,12 @@ def cli_create(domain: str, wp: bool = False):
         console.print(f"[green]✓ {domain} created successfully![/green]")
         if result.stdout:
             console.print(result.stdout)
+        # Fix WordPress permissions after creation
+        if wp:
+            site_path = WEBROOT / domain
+            if site_path.exists():
+                fix_wp_permissions(site_path)
+                console.print(f"[green]✓ Permissions fixed for {domain}[/green]")
     else:
         console.print(f"[red]Error:[/red] {result.stderr or result.stdout}")
 
@@ -351,6 +359,68 @@ def get_site_root(name: str) -> Optional[Path]:
     return None
 
 
+def fix_wp_permissions(site_path: Path) -> bool:
+    """Fix WordPress permissions for a single site"""
+    if not site_path.exists():
+        return False
+
+    # Add the site owner to www-data's group if not already
+    run(["sudo", "-n", "usermod", "-aG", WP_GROUP, Path.home().name])
+
+    # Fix group ownership and permissions for wp-content
+    wp_content = site_path / "wp-content"
+    if wp_content.exists():
+        pkexec(["chgrp", "-R", WP_GROUP, str(wp_content)])
+        pkexec(["chmod", "-R", "775", str(wp_content)])
+
+    # Fix uploads directory specifically
+    uploads = wp_content / "uploads"
+    if uploads.exists():
+        pkexec(["chgrp", "-R", WP_GROUP, str(uploads)])
+        pkexec(["chmod", "-R", "775", str(uploads)])
+
+    # Fix upgrade directory
+    upgrade = wp_content / "upgrade"
+    if upgrade.exists():
+        pkexec(["chgrp", "-R", WP_GROUP, str(upgrade)])
+        pkexec(["chmod", "-R", "775", str(upgrade)])
+
+    # Fix plugin storage directories for ai1wm-backups
+    for storage_dir in site_path.rglob("ai1wm-backups"):
+        pkexec(["chgrp", "-R", WP_GROUP, str(storage_dir)])
+        pkexec(["chmod", "-R", "775", str(storage_dir)])
+
+    for storage_dir in site_path.rglob("all-in-one-wp-migration/storage"):
+        pkexec(["chgrp", "-R", WP_GROUP, str(storage_dir)])
+        pkexec(["chmod", "-R", "775", str(storage_dir)])
+
+    return True
+
+
+def fix_all_permissions():
+    """Fix WordPress permissions for all sites"""
+    from rich.console import Console
+    from rich.progress import Progress
+    console = Console()
+
+    sites = get_all_sites()
+    wp_sites = [s for s in sites if s["type"] == "WP" and s["root"]]
+
+    if not wp_sites:
+        console.print("[yellow]No WordPress sites found[/yellow]")
+        return
+
+    with Progress() as progress:
+        task = progress.add_task("[bold]Fixing permissions...", total=len(wp_sites))
+        for s in wp_sites:
+            root = Path(s["root"])
+            if fix_wp_permissions(root):
+                progress.update(task, description=f"[bold]Fixed {s['name']}...")
+            progress.update(task, advance=1)
+
+    console.print(f"[green]✓ Permissions fixed for {len(wp_sites)} WordPress sites[/green]")
+
+
 def ensure_backup_dir(site: str) -> Path:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     p = BACKUP_DIR / site / ts
@@ -364,6 +434,8 @@ def backup_site(site: str, dest: Optional[Path] = None) -> Optional[Path]:
         return None
     if dest is None:
         dest = ensure_backup_dir(site)
+    else:
+        dest.mkdir(parents=True, exist_ok=True)
 
     meta = {"site": site, "date": datetime.now().isoformat(), "type": "site", "files": [], "db": None}
 
@@ -423,7 +495,7 @@ def restore_site(site: str, backup_path: Path):
                 pass
 
     # Fix permissions
-    subprocess.run(["chmod", "-R", "a+rX", str(root)], check=False, timeout=30)
+    fix_wp_permissions(root)
 
 
 # ============= Operations =============
@@ -511,16 +583,24 @@ def cli_update_wp(site: str):
             check=True, timeout=30,
         )
 
-        # Replace wp-admin and wp-includes
-        for d in ["wp-admin", "wp-includes"]:
-            src = tmp / "wordpress" / d
-            dst = root / d
-            if dst.exists():
-                shutil.rmtree(dst)
-            shutil.copytree(src, dst)
+        # Replace ALL core files (root PHP files + wp-admin + wp-includes) so the
+        # installed core stays a consistent version. Preserve wp-config.php and wp-content.
+        src_wp = tmp / "wordpress"
+        for item in src_wp.iterdir():
+            if item.name in ("wp-content", "wp-config.php"):
+                continue
+            target = root / item.name
+            if target.is_dir():
+                shutil.rmtree(target)
+            elif target.exists():
+                target.unlink()
+            if item.is_dir():
+                shutil.copytree(item, target)
+            else:
+                shutil.copy2(item, target)
 
         # Copy new wp-content except existing themes/plugins/uploads
-        wp_content_src = tmp / "wordpress" / "wp-content"
+        wp_content_src = src_wp / "wp-content"
         wp_content_dst = root / "wp-content"
         if wp_content_dst.exists():
             for item in wp_content_src.iterdir():
@@ -533,12 +613,16 @@ def cli_update_wp(site: str):
         # Cleanup tmp
         shutil.rmtree(tmp, ignore_errors=True)
 
-        # Run DB upgrade via wp-admin/upgrade.php
+        # Apply pending DB schema upgrades locally. An unauthenticated
+        # wp-admin/upgrade.php request cannot run them (needs an admin session).
+        php_code = (
+            "$_SERVER['HTTP_HOST']='localhost';define('WP_ADMIN',true);"
+            "require 'wp-load.php';require ABSPATH.'wp-admin/includes/upgrade.php';wp_upgrade();"
+        )
         try:
             subprocess.run(
-                ["curl", "-s", "-o", "/dev/null", "--max-time", "30",
-                 f"http://{site}/wp-admin/upgrade.php?step=1"],
-                timeout=30,
+                ["php", "-r", php_code],
+                cwd=str(root), check=False, timeout=120,
             )
         except Exception:
             pass
@@ -605,6 +689,15 @@ def cli_ssl(site: str):
             )
             if "listen 443 ssl" not in text:
                 text = text.replace("listen 80;", "listen 80;\n    listen 443 ssl http2;", 1)
+            # Also listen on IPv6: browsers prefer ::1 (from /etc/hosts) and would
+            # otherwise hit another vhost's cert -> ERR_CERT_COMMON_NAME_INVALID.
+            if "listen [::]:80;" not in text:
+                text = text.replace("listen 80;", "listen 80;\n    listen [::]:80;", 1)
+            if "listen [::]:443" not in text:
+                text = text.replace(
+                    "listen 443 ssl http2;",
+                    "listen 443 ssl http2;\n    listen [::]:443 ssl http2;", 1,
+                )
             if "ssl_certificate" not in text:
                 # Insert SSL block after the line containing "root "
                 text = re.sub(r"(^    root [^\n]+)", rf"\1\n{ssl_block}", text, count=1, flags=re.MULTILINE)
@@ -892,6 +985,7 @@ def run_dashboard():
                     Button("■ Stop All", id="stop", variant="error"),
                     Button("⟳ Restart", id="restart", variant="warning"),
                     Button("🔌 Toggle", id="toggle", variant="default"),
+                    Button("🔧 Fix Perms", id="fix-perms", variant="default"),
                     Button("⚙ Actions", id="actions", variant="default"),
                     Button("➕ Create", id="create", variant="primary"),
                     classes="actions",
@@ -1014,6 +1108,24 @@ def run_dashboard():
                 self.refresh_all()
 
         @work
+        async def action_fix_permissions(self):
+            table = self.query_one("#sites-table", DataTable)
+            row_key, col = table.cursor_coordinate
+            if row_key is None:
+                # Fix all sites
+                fix_all_permissions()
+            else:
+                site = table.get_row_at(row_key)[0]
+                info = get_site_info(site)
+                if info["type"] == "WP" and info["root"]:
+                    root = Path(info["root"])
+                    fix_wp_permissions(root)
+                    from rich.console import Console
+                    console = Console()
+                    console.print(f"[green]✓ Permissions fixed for {site}[/green]")
+            self.refresh_all()
+
+        @work
         async def action_actions(self):
             table = self.query_one("#sites-table", DataTable)
             row_key, col = table.cursor_coordinate
@@ -1093,6 +1205,8 @@ def run_dashboard():
                 self.action_restart()
             elif btn_id == "toggle":
                 self.action_toggle()
+            elif btn_id == "fix-perms":
+                self.action_fix_permissions()
             elif btn_id == "actions":
                 self.action_actions()
             elif btn_id == "create":
@@ -1197,6 +1311,24 @@ def main():
     def export(site: str = typer.Argument(..., help="Site name")):
         """Export a site for transfer"""
         cli_export(site)
+
+    @app.command()
+    def fix_permissions(site: Optional[str] = typer.Argument(None, help="Site name (optional, fixes all if omitted)")):
+        """Fix WordPress permissions for a site or all sites"""
+        if site:
+            from rich.console import Console
+            console = Console()
+            info = get_site_info(site)
+            if not info["root"]:
+                console.print(f"[red]Error:[/red] site '{site}' not found")
+                return
+            root = Path(info["root"])
+            if fix_wp_permissions(root):
+                console.print(f"[green]✓ Permissions fixed for {site}[/green]")
+            else:
+                console.print(f"[red]Error:[/red] could not fix permissions for {site}")
+        else:
+            fix_all_permissions()
 
     @app.command()
     def dashboard():
