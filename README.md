@@ -18,14 +18,24 @@
 sudo apt install ./sites-dashboard_1.2.0_all.deb
 ```
 
-### الطريقة 2: السكربت
+### الطريقة 2: AppImage (بدون تثبيت)
+```bash
+# أنزّل Sites-Dashboard_1.2.0_x86_64.AppImage من صفحة Releases، ثم:
+chmod +x Sites-Dashboard_1.2.0_x86_64.AppImage
+./Sites-Dashboard_1.2.0_x86_64.AppImage list       # يعمل مباشرة (بايثون + المكتبات مدمجة)
+./Sites-Dashboard_1.2.0_x86_64.AppImage            # تفتح لوحة التحكم التفاعلية
+```
+> **ملحوظة:** نسخة AppImage محمولة (لا تحتاج `pip install`) لكنها تستخدم خدمات
+> الجهاز (nginx / php-fpm / mariadb) — ثبّتها أولاً عبر `install.sh` أو الباكج.
+
+### الطريقة 3: السكربت
 ```bash
 git clone https://github.com/touficmamdouh/sites-dashboard.git
 cd sites-dashboard
 ./install.sh
 ```
 
-### الطريقة 3: البناء اليدوي من المصدر + تركيب
+### الطريقة 4: البناء اليدوي من المصدر + تركيب
 ```bash
 git clone https://github.com/touficmamdouh/sites-dashboard.git
 cd sites-dashboard
@@ -129,6 +139,7 @@ sites-dashboard/
 ├── install.sh      # المثبّت (ينزّل الناقص تلقائياً)
 ├── build.sh        # يبني .deb
 ├── DEBIAN/         # ملفات الباكج (control / postinst / prerm)
+├── appimage.sh    # يبني نسخة AppImage المحمولة
 ├── bin/
 │   ├── sites       # الأداة الرئيسية (Python CLI + TUI)
 │   └── newsite     # مساعد إنشاء المواقع
@@ -154,14 +165,25 @@ Stack: **Nginx + PHP-FPM + MariaDB + WordPress** (optional).
 sudo apt install ./sites-dashboard_1.2.0_all.deb
 ```
 
-### Option 2: Script
+### Option 2: AppImage (no install)
+```bash
+# Download Sites-Dashboard_1.2.0_x86_64.AppImage from Releases, then:
+chmod +x Sites-Dashboard_1.2.0_x86_64.AppImage
+./Sites-Dashboard_1.2.0_x86_64.AppImage list   # runs directly (Python + libs bundled)
+./Sites-Dashboard_1.2.0_x86_64.AppImage        # opens the interactive dashboard
+```
+> **Note:** the AppImage is portable (no `pip install` needed) but uses the host
+> services (nginx / php-fpm / mariadb) — install those first via `install.sh` or the .deb.
+> You can also rebuild it yourself: `./appimage.sh [version] [repo-dir]`.
+
+### Option 3: Script
 ```bash
 git clone https://github.com/touficmamdouh/sites-dashboard.git
 cd sites-dashboard
 ./install.sh
 ```
 
-### Option 3: Build from source + install
+### Option 4: Build from source + install
 ```bash
 git clone https://github.com/touficmamdouh/sites-dashboard.git
 cd sites-dashboard
@@ -253,6 +275,7 @@ sites-dashboard/
 ├── install.sh      # installer (auto-installs missing deps)
 ├── build.sh        # builds the .deb
 ├── DEBIAN/         # package files (control / postinst / prerm)
+├── appimage.sh    # builds the portable AppImage
 ├── bin/
 │   ├── sites       # main tool (Python CLI + TUI)
 │   └── newsite     # site creation helper
