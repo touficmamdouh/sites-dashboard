@@ -109,20 +109,43 @@ if metadata.get('app') and metadata['app'] != str(app):
     raise SystemExit('An installation already exists at ' + metadata['app'] + '; reuse its SITES_PREFIX.')
 files = metadata.setdefault('owned_files', {})
 services = metadata.setdefault('owned_services', [])
+pending = metadata.setdefault('pending_files', {})
 metadata.update(app=str(app), platform=platform_name, ready=False, uninstalled=False)
 
 
 def save():
     with tempfile.NamedTemporaryFile(mode='w', dir=state, delete=False) as f:
         json.dump(metadata, f, indent=2, default=str)
+        f.flush()
+        os.fsync(f.fileno())
         temporary = Path(f.name)
     temporary.chmod(0o600)
     temporary.replace(metadata_path)
 
 
+def recover_replacement(path):
+    record = pending.get(str(path))
+    if record is None:
+        return
+    if path.is_symlink():
+        raise RuntimeError(f'Refusing interrupted replacement symlink: {path}')
+    current = digest(path.read_bytes()) if path.exists() else None
+    if current not in (record['old'], record['new']):
+        raise RuntimeError(f'Interrupted replacement was edited: {path}')
+    if current == record['new']:
+        files[str(path)] = record['new']
+    staged = Path(record['temporary'])
+    if staged.parent != path.parent or not staged.name.startswith('.sites-dashboard-') or staged.is_symlink():
+        raise RuntimeError(f'Invalid replacement staging path: {staged}')
+    staged.unlink(missing_ok=True)
+    del pending[str(path)]
+    save()
+
+
 def write_owned(path, content, mode=0o644, preserve_edits=False):
     path = Path(path)
     content = content.encode() if isinstance(content, str) else content
+    recover_replacement(path)
     if path.is_symlink():
         raise RuntimeError(f'Refusing symlink: {path}')
     if path.exists():
@@ -135,13 +158,18 @@ def write_owned(path, content, mode=0o644, preserve_edits=False):
         if current == content:
             return False
     path.parent.mkdir(parents=True, exist_ok=True)
-    files[str(path)] = digest(content)
-    save()
-    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as f:
-        f.write(content)
+    with tempfile.NamedTemporaryFile(dir=path.parent, prefix='.sites-dashboard-', delete=False) as f:
         temporary = Path(f.name)
+        pending[str(path)] = {'old': files.get(str(path)), 'new': digest(content), 'temporary': str(temporary)}
+        save()
+        f.write(content)
+        f.flush()
+        os.fsync(f.fileno())
     temporary.chmod(mode)
     temporary.replace(path)
+    files[str(path)] = digest(content)
+    del pending[str(path)]
+    save()
     return True
 
 
@@ -183,6 +211,9 @@ def quote_nginx(value):
 
 
 try:
+    for filename in list(pending):
+        recover_replacement(Path(filename))
+    metadata.pop('cleanup_runtime_done', None)
     for key, value in metadata.get('environment', {}).items():
         os.environ.setdefault(key, value)
     if platform_name == 'macos':
@@ -228,6 +259,17 @@ try:
     write_owned(app / 'uninstall.sh', (source / 'uninstall.sh').read_bytes(), 0o755)
 
     if platform_name == 'macos':
+        mailpit_env = Path(os.environ.get('HOMEBREW_USER_CONFIG_HOME', str(Path.home() / '.homebrew'))) / 'services/mailpit.env'
+        mailpit_settings = 'MP_SMTP_BIND_ADDR=127.0.0.1:1025\nMP_UI_BIND_ADDR=127.0.0.1:8025\n'
+        if mailpit_env.exists() and str(mailpit_env) not in files:
+            existing = dict(line.split('=', 1) for line in mailpit_env.read_text().splitlines()
+                            if line and not line.startswith('#') and '=' in line)
+            if (existing.get('MP_SMTP_BIND_ADDR'), existing.get('MP_UI_BIND_ADDR')) != ('127.0.0.1:1025', '127.0.0.1:8025'):
+                raise RuntimeError(f'Preserving {mailpit_env}: configure both Mailpit bindings to loopback before retrying.')
+        else:
+            mailpit_changed = write_owned(mailpit_env, mailpit_settings, 0o600)
+            if mailpit_changed and 'mailpit' in services and manager.status('mailpit') == 'active':
+                check(manager.restart('mailpit'))
         write_owned(app / 'packaging/macos/com.sites-dashboard.nginx.plist.in',
                     (source / 'packaging/macos/com.sites-dashboard.nginx.plist.in').read_bytes())
         nginx_dir = runtime.brew_prefix / 'etc/nginx'
@@ -309,6 +351,20 @@ try:
     wait_ready('Mailpit SMTP', lambda: tcp(1025))
     wait_ready('Mailpit HTTP', lambda: tcp(8025))
     if platform_name == 'macos':
+        def mailpit_loopback():
+            listeners = command(['lsof', '-nP', '-a', '-c', 'mailpit', '-iTCP:1025', '-iTCP:8025',
+                                 '-sTCP:LISTEN', '-Fn'])
+            addresses = [line[1:] for line in listeners.splitlines() if line.startswith('n')]
+            if any(address not in ('127.0.0.1:1025', '127.0.0.1:8025') for address in addresses):
+                raise ValueError('Mailpit listeners must bind only to loopback (127.0.0.1).')
+            if set(addresses) != {'127.0.0.1:1025', '127.0.0.1:8025'}:
+                raise RuntimeError('Cannot verify both Mailpit loopback listeners.')
+        try:
+            wait_ready('Mailpit loopback bindings', mailpit_loopback)
+        except (OSError, RuntimeError, ValueError):
+            if 'mailpit' in services:
+                check(manager.stop('mailpit'))
+            raise
         import sites_platform
         sites_platform.NGINX_PLIST_TEMPLATE = app / 'packaging/macos/com.sites-dashboard.nginx.plist.in'
         metadata['nginx_owned'] = True

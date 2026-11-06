@@ -1,12 +1,137 @@
 #!/bin/sh
-# Apt owns system dependencies; do not run pip or apt recursively here.
+# Also installed as the Linux-only helper used by prerm before dpkg removes it.
 set -eu
-case "${1:-configure}" in
-configure)
+ACTION="${1:-configure}"
+case "$ACTION" in configure|remove) ;; *) exit 0 ;; esac
+python3 - "$ACTION" <<'PY'
+import hashlib
+import json
+import os
+import platform
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+from pathlib import Path
+
+action = sys.argv[1]
+root = Path('/var/lib/sites-dashboard')
+manifest = root / 'package-lifecycle.json'
+if root.is_symlink() or manifest.is_symlink():
+    raise SystemExit('Refusing symlinked package state.')
+metadata = json.loads(manifest.read_text()) if manifest.exists() else {'owned_files': {}}
+unit = Path('/usr/lib/systemd/system/sites-dashboard-mailpit.service')
+
+
+def command(args):
+    result = subprocess.run(list(map(str, args)), capture_output=True, text=True)
+    if result.returncode:
+        raise RuntimeError(result.stderr or result.stdout or str(args))
+    return result.stdout
+
+
+def digest(content):
+    return hashlib.sha256(content).hexdigest()
+
+
+def save():
+    root.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode='w', dir=root, delete=False) as f:
+        json.dump(metadata, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+        temporary = Path(f.name)
+    temporary.chmod(0o600)
+    temporary.replace(manifest)
+
+
+def create_owned(destination, content, mode):
+    if destination.is_symlink():
+        raise RuntimeError('Refusing symlink: ' + str(destination))
+    if destination.exists():
+        if metadata['owned_files'].get(str(destination)) != digest(destination.read_bytes()):
+            raise RuntimeError('Preserving unowned/edited package file: ' + str(destination))
+        return
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=destination.parent, delete=False) as f:
+        f.write(content)
+        f.flush()
+        os.fsync(f.fileno())
+        temporary = Path(f.name)
+    try:
+        temporary.chmod(mode)
+        # New files only: an interrupted publication can be absent or match this
+        # recorded hash; no old-content ownership record is overwritten.
+        metadata['owned_files'][str(destination)] = digest(content)
+        save()
+        os.link(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+try:
+    if action == 'remove':
+        if metadata.get('service_owned'):
+            if not unit.exists() or digest(unit.read_bytes()) == metadata['unit_hash']:
+                command(['systemctl', 'disable', '--now', 'sites-dashboard-mailpit.service'])
+                command(['systemctl', 'daemon-reload'])
+            else:
+                raise RuntimeError('Preserving edited Mailpit systemd unit; inspect it before retrying removal.')
+        for filename, expected in metadata['owned_files'].items():
+            target = Path(filename)
+            if target.exists() and not target.is_symlink() and digest(target.read_bytes()) == expected:
+                target.unlink()
+        metadata['service_owned'] = False
+        save()
+    else:
+        architecture = {'x86_64': 'amd64', 'aarch64': 'arm64', 'arm64': 'arm64'}.get(platform.machine())
+        checksums = {
+            'amd64': 'a35c053509441b95fb96da6479b3a26b3eb309e223232aced28255c011d29efc',
+            'arm64': '12c736a73d122c55d3531ac2fc92cad96dbde283af661b6701fe32892bd438c5',
+        }
+        if architecture not in checksums:
+            raise RuntimeError('Mailpit package provisioning supports amd64 and arm64 Linux.')
+        binary = root / 'bin/mailpit'
+        if not binary.exists():
+            with tempfile.TemporaryDirectory(prefix='sites-package-mailpit-') as temporary:
+                archive = Path(temporary) / 'mailpit.tar.gz'
+                command(['curl', '--fail', '--location', '--silent', '--show-error', '--output', archive,
+                         f'https://github.com/axllent/mailpit/releases/download/v1.30.7/mailpit-linux-{architecture}.tar.gz'])
+                if command(['sha256sum', archive]).split()[0] != checksums[architecture]:
+                    raise RuntimeError('Mailpit checksum verification failed; refusing installation.')
+                with tarfile.open(archive) as bundle:
+                    member = bundle.getmember('mailpit')
+                    if not member.isfile() or member.size > 256 * 1024 * 1024:
+                        raise RuntimeError('Invalid Mailpit archive entry.')
+                    create_owned(binary, bundle.extractfile(member).read(), 0o755)
+        elif binary.is_symlink() or metadata['owned_files'].get(str(binary)) != digest(binary.read_bytes()):
+            raise RuntimeError('Refusing unowned/edited Mailpit executable: ' + str(binary))
+        relay = Path('/etc/msmtprc')
+        if not relay.exists() and not relay.is_symlink():
+            create_owned(relay, Path('/usr/share/sites-dashboard/msmtprc').read_bytes(), 0o644)
+        if shutil.which('systemctl'):
+            installed = command(['systemctl', 'list-unit-files', 'mailpit.service', '--no-legend'])
+            foreign = any(line.split() and line.split()[0] == 'mailpit.service' for line in installed.splitlines())
+            if metadata.get('service_owned') or not foreign:
+                if unit.is_symlink():
+                    raise RuntimeError('Refusing symlinked Mailpit systemd unit.')
+                metadata.update(service_owned=True, unit_hash=digest(unit.read_bytes()))
+                save()
+                command(['systemctl', 'daemon-reload'])
+                # Enabling the alias makes the shared ServiceManager's mailpit
+                # name resolve to this package's dedicated service.
+                command(['systemctl', 'enable', '--now', 'sites-dashboard-mailpit.service'])
+            else:
+                print('Preserving the existing mailpit.service; package service was not started.')
+except (OSError, ValueError, RuntimeError, KeyError, tarfile.TarError) as error:
+    print('Package mail setup failed: ' + str(error), file=sys.stderr)
+    sys.exit(1)
+PY
+if [ "$ACTION" = configure ]; then
     if ! python3 -c 'import typer, rich, textual' 2>/dev/null; then
         echo 'Install Python UI dependencies with: apt-get install python3-typer python3-rich python3-textual' >&2
     fi
     echo 'sites-dashboard installed. Run: sites dashboard'
-    ;;
-esac
+fi
 exit 0

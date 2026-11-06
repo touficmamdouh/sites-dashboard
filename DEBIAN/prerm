@@ -1,5 +1,14 @@
 #!/bin/sh
 set -eu
-# dpkg removes package files. Never purge shared dependencies or user data,
-# stop shared services, or remove executables during an upgrade.
+# Keep upgrades intact. Only the helper's recorded package-owned mail service
+# and unchanged generated files are eligible for removal; data stays in place.
+if [ "${1:-}" = remove ]; then
+    python3 - <<'PY'
+from pathlib import Path
+import subprocess
+helper = Path('/usr/lib/sites-dashboard/package-lifecycle')
+if helper.exists():
+    subprocess.run([str(helper), 'remove'], check=True)
+PY
+fi
 exit 0

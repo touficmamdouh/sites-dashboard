@@ -1,5 +1,6 @@
 """Exercise lifecycle scripts with real temporary files and fake OS commands."""
 
+import hashlib
 import json
 import os
 import pty
@@ -15,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 RUN = subprocess.run
 
 FAKE_COMMAND = r'''#!PYTHON
-import json, os, shutil, sys
+import hashlib, io, json, os, shutil, sys, tarfile
 from pathlib import Path
 name = Path(sys.argv[0]).name
 args = sys.argv[1:]
@@ -42,6 +43,14 @@ elif name == 'brew':
     elif args[:2] == ['services', 'info']:
         print(json.dumps([{'name': args[2], 'status': state.get(args[2], 'none')}]))
     elif args[:1] == ['services'] and args[1] in ('start', 'restart', 'stop'):
+        if args[1:] == ['restart', 'php'] and os.environ.get('MOCK_PHP_RESTART_FAIL'):
+            print('PHP restart failed', file=sys.stderr); sys.exit(1)
+        if args[2] == 'mailpit' and args[1] != 'stop':
+            envfile = Path(os.environ['HOME']) / '.homebrew/services/mailpit.env'
+            values = dict(line.split('=', 1) for line in envfile.read_text().splitlines()
+                          if line and not line.startswith('#')) if envfile.exists() else {}
+            (root / 'mailpit-bindings.json').write_text(json.dumps([
+                values.get('MP_SMTP_BIND_ADDR', '0.0.0.0:1025'), values.get('MP_UI_BIND_ADDR', '0.0.0.0:8025')]))
         state[args[2]] = 'none' if args[1] == 'stop' else 'started'
         statefile.write_text(json.dumps(state))
     elif args[:1] == ['install']: pass
@@ -56,7 +65,10 @@ elif name in ('python3', 'python'):
 elif name == 'php': print('8.3' if '-r' in args else 'PHP 8.3')
 elif name == 'php-fpm': print('[www]\nlisten = ' + str(brew / 'var/run/php-fpm.sock'), file=sys.stderr)
 elif name == 'sudo':
-    if args == ['-v']: sys.exit(0)
+    if args == ['-v']:
+        (root / 'sudo-valid').touch(); sys.exit(0)
+    if os.environ.get('MOCK_SUDO_EXPIRED') and not (root / 'sudo-valid').exists():
+        print('sudo: a password is required', file=sys.stderr); sys.exit(1)
     assert args.pop(0) == '-n', args
     command = Path(args.pop(0)).name
     if command in ('install', 'ln', 'mv'):
@@ -67,7 +79,10 @@ elif name == 'sudo':
         else: source.replace(destination)
     elif command == 'rm':
         for path in args:
-            if not path.startswith('-'): owned(path).unlink(missing_ok=True)
+            if not path.startswith('-'):
+                if path == '/etc/systemd/system/mailpit.service':
+                    path = root / 'system/etc/systemd/system/mailpit.service'
+                owned(path).unlink(missing_ok=True)
     elif command == 'launchctl':
         if args[0] == 'bootstrap': (root / 'loaded').touch()
         elif args[0] == 'bootout': (root / 'loaded').unlink(missing_ok=True)
@@ -83,6 +98,26 @@ elif name == 'launchctl':
 elif name == 'curl':
     if 'raw.githubusercontent.com/Homebrew/install/HEAD/install.sh' in ' '.join(args):
         print('echo homebrew-installed >> "$SITES_TEST_ROOT/bootstrap"')
+    elif any('github.com/axllent/mailpit/releases/' in arg for arg in args):
+        target = owned(args[args.index('--output') + 1])
+        data = io.BytesIO()
+        with tarfile.open(fileobj=data, mode='w') as archive:
+            payload = b'#!/bin/sh\nexit 0\n'
+            entry = tarfile.TarInfo('mailpit'); entry.size = len(payload); entry.mode = 0o755
+            archive.addfile(entry, io.BytesIO(payload))
+        if args[-1].endswith('checksums.txt'):
+            target.write_text(hashlib.sha256(data.getvalue()).hexdigest() + '  mailpit-linux-amd64.tar.gz\n')
+        else:
+            target.write_bytes(data.getvalue())
+elif name == 'lsof':
+    path = root / 'mailpit-bindings.json'
+    addresses = json.loads(path.read_text()) if path.exists() else ['127.0.0.1:1025', '127.0.0.1:8025']
+    if os.environ.get('MOCK_MAILPIT_PUBLIC'): addresses = ['*:1025', '*:8025']
+    print('p456\n' + '\n'.join('n' + addr for addr in addresses))
+elif name == 'sha256sum':
+    assert owned(args[0]).is_file()
+    checksum = '0' * 64 if os.environ.get('MOCK_BAD_MAILPIT_DOWNLOAD') else 'a35c053509441b95fb96da6479b3a26b3eb309e223232aced28255c011d29efc'
+    print(checksum, args[0])
 elif name == 'systemctl':
     if 'list-unit-files' in args: print('php8.3-fpm.service enabled')
     elif 'list-units' in args: print('php8.3-fpm.service loaded active running')
@@ -103,6 +138,35 @@ PATCH_HOST = r'''
 import os, platform, socket, sys, time
 from dataclasses import replace
 from pathlib import Path
+import tempfile
+original_replace = Path.replace
+def replace_path(self, destination):
+    if os.environ.get('MOCK_REPLACE_TARGET') == str(destination):
+        if os.environ.get('MOCK_REPLACE_PHASE') == 'after':
+            original_replace(self, destination)
+            os._exit(77)
+        raise OSError('injected publication failure')
+    return original_replace(self, destination)
+Path.replace = replace_path
+original_unlink = Path.unlink
+def unlink_path(self, *args, **kwargs):
+    if os.environ.get('MOCK_UNLINK_TARGET') == str(self):
+        raise OSError('injected final cleanup failure')
+    return original_unlink(self, *args, **kwargs)
+Path.unlink = unlink_path
+if os.environ.get('MOCK_SYSTEM_ROOT'):
+    original_new = Path.__new__
+    original_init = Path.__init__
+    def redirect_parts(parts):
+        if parts and str(parts[0]).startswith(('/etc/', '/var/lib/sites-dashboard', '/usr/lib/systemd/', '/usr/lib/sites-dashboard', '/usr/share/sites-dashboard', '/run/systemd/')):
+            return (os.environ['MOCK_SYSTEM_ROOT'] + str(parts[0]), *parts[1:])
+        return parts
+    def redirect(cls, *parts, **kwargs):
+        return original_new(cls, *redirect_parts(parts), **kwargs)
+    def redirect_init(self, *parts, **kwargs):
+        return original_init(self, *redirect_parts(parts), **kwargs)
+    Path.__new__ = staticmethod(redirect)
+    Path.__init__ = redirect_init
 original_exists = Path.exists
 def exists(self):
     if os.environ.get('MOCK_OS') == 'Linux' and str(self) in ('/etc/msmtprc', '/etc/systemd/system/mailpit.service'):
@@ -172,7 +236,7 @@ def sandbox(tmp_path):
                     (self.bin / name).symlink_to(shutil.which(name))
             names = ('uname', 'sw_vers', 'id', 'brew', 'python3', 'sudo', 'launchctl',
                      'curl', 'systemctl', 'nginx', 'mariadb', 'mysql', 'mailpit', 'mkcert',
-                     'wget', 'apt-get', 'pip3', 'msmtp', 'php', 'php-fpm', 'rm')
+                     'wget', 'apt-get', 'pip3', 'msmtp', 'php', 'php-fpm', 'rm', 'lsof', 'sha256sum')
             for name in names:
                 (self.bin / name).unlink(missing_ok=True)
                 self.fake(self.bin / name)
@@ -352,7 +416,7 @@ def test_debian_prerm_does_not_remove_binaries_on_upgrade_or_purge_dependencies(
     for reason in ('upgrade', 'remove', 'failed-upgrade', 'deconfigure'):
         result = sandbox.run('DEBIAN/prerm', reason)
         assert result.returncode == 0, result.stderr
-    assert not sandbox.calls()
+    assert not any(c[0] in ('apt-get', 'pip3', 'systemctl', 'rm') for c in sandbox.calls())
 
 
 def test_uninstall_is_idempotent(sandbox):
@@ -453,6 +517,166 @@ def test_profile_edits_inside_owned_block_survive_upgrade(sandbox):
 
 
 def test_debian_postinst_does_not_modify_shared_python_packages(sandbox):
+    sandbox.env['MOCK_SYSTEM_ROOT'] = str(sandbox.root / 'system')
+    sandbox.env.update(MOCK_OS='Linux', MOCK_ARCH='x86_64')
+    package = sandbox.run('build.sh', '1.3.0')
+    assert package.returncode == 0, package.stderr
+    RUN(['dpkg-deb', '-x', str(sandbox.source / 'sites-dashboard_1.3.0_all.deb'),
+         str(sandbox.root / 'system')], check=True, capture_output=True)
     result = sandbox.run('DEBIAN/postinst', 'configure')
     assert result.returncode == 0, result.stderr
     assert not any('pip' in c or 'apt-get' in c for c in sandbox.calls())
+
+
+def test_macos_mailpit_is_loopback_after_service_restart(sandbox):
+    installed(sandbox)
+    binding_file = sandbox.root / 'mailpit-bindings.json'
+    assert json.loads(binding_file.read_text()) == ['127.0.0.1:1025', '127.0.0.1:8025']
+    result = RUN([str(sandbox.brew / 'bin/brew'), 'services', 'restart', 'mailpit'],
+                 env=sandbox.env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(binding_file.read_text()) == ['127.0.0.1:1025', '127.0.0.1:8025']
+    assert any(c[0] == 'lsof' for c in sandbox.calls())
+
+
+def test_macos_rejects_public_mailpit_and_stops_owned_service(sandbox):
+    sandbox.env['MOCK_MAILPIT_PUBLIC'] = '1'
+    result = sandbox.run()
+    assert result.returncode != 0
+    assert 'loopback' in result.stderr.lower()
+    assert json.loads((sandbox.root / 'services.json').read_text())['mailpit'] == 'none'
+
+
+def test_uninstall_php_failure_retains_cleanup_dependencies_and_can_retry(sandbox):
+    (sandbox.root / 'services.json').write_text(json.dumps({'php': 'started'}))
+    data = installed(sandbox)
+    script = Path(data['app']) / 'uninstall.sh'
+    sandbox.env['MOCK_PHP_RESTART_FAIL'] = '1'
+    result = sandbox.run('uninstall.sh')
+    assert result.returncode != 0
+    assert script.exists()
+    assert (Path(data['app']) / 'bin/sites_platform.py').exists()
+    assert not json.loads((sandbox.state / 'runtime.json').read_text())['uninstalled']
+    sandbox.env.pop('MOCK_PHP_RESTART_FAIL')
+    # Retry the installed uninstaller, not a source copy importing source modules.
+    result = RUN([str(sandbox.bin / 'bash'), str(script)],
+                 env={**sandbox.env, 'MOCK_INSTALLED_ONLY': '1'}, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert json.loads((sandbox.state / 'runtime.json').read_text())['uninstalled']
+    assert '# >>> sites-dashboard >>>' not in (sandbox.home / '.zshrc').read_text()
+
+
+def test_linux_uninstall_authenticates_before_privileged_cleanup(sandbox):
+    sandbox.env.update(MOCK_OS='Linux', MOCK_ARCH='x86_64')
+    sandbox.env['MOCK_SYSTEM_ROOT'] = str(sandbox.root / 'system')
+    data = installed(sandbox)
+    unit = sandbox.root / 'system/etc/systemd/system/mailpit.service'
+    assert unit.exists()
+    (sandbox.root / 'sudo-valid').unlink(missing_ok=True)
+    sandbox.env['MOCK_SUDO_EXPIRED'] = '1'
+    before = len(sandbox.calls())
+    result = sandbox.run('uninstall.sh')
+    assert result.returncode == 0, result.stderr
+    calls = [c for c in sandbox.calls()[before:] if c[0] == 'sudo']
+    assert calls[0] == ['sudo', '-v']
+    assert not unit.exists()
+
+
+@pytest.mark.parametrize('phase', ['before', 'after'])
+@pytest.mark.parametrize('recovery', ['upgrade', 'uninstall'])
+def test_interrupted_replacement_accepts_old_and_new_owned_bytes(sandbox, phase, recovery):
+    data = installed(sandbox)
+    target = Path(data['app']) / 'bin/sites_config.py'
+    original = target.read_bytes()
+    newer = original + b'\nUPGRADE_MARKER = True\n'
+    (sandbox.source / 'bin/sites_config.py').write_bytes(newer)
+    sandbox.env.update(MOCK_REPLACE_TARGET=str(target), MOCK_REPLACE_PHASE=phase)
+    failed = sandbox.run()
+    assert failed.returncode != 0
+    assert target.read_bytes() == (original if phase == 'before' else newer)
+    sandbox.env.pop('MOCK_REPLACE_TARGET')
+    result = sandbox.run('uninstall.sh' if recovery == 'uninstall' else 'install.sh')
+    assert result.returncode == 0, result.stderr
+    if recovery == 'uninstall':
+        assert not target.exists()
+    else:
+        assert target.read_bytes() == newer
+        state = json.loads((sandbox.state / 'runtime.json').read_text())
+        assert state['owned_files'][str(target)] == hashlib.sha256(newer).hexdigest()
+        assert not state.get('pending_files')
+
+
+def test_debian_fresh_install_provisions_loopback_mail_and_preserves_user_data(sandbox):
+    sandbox.env.update(MOCK_OS='Linux', MOCK_ARCH='x86_64',
+                       MOCK_SYSTEM_ROOT=str(sandbox.root / 'system'))
+    result = sandbox.run('build.sh', '1.3.0')
+    assert result.returncode == 0, result.stderr
+    package = sandbox.source / 'sites-dashboard_1.3.0_all.deb'
+    destination = sandbox.root / 'system'
+    RUN(['dpkg-deb', '-x', str(package), str(destination)], check=True, capture_output=True)
+    result = sandbox.run('DEBIAN/postinst', 'configure')
+    assert result.returncode == 0, result.stderr
+    binary = destination / 'var/lib/sites-dashboard/bin/mailpit'
+    unit = destination / 'usr/lib/systemd/system/sites-dashboard-mailpit.service'
+    relay = destination / 'etc/msmtprc'
+    assert binary.is_file() and os.access(binary, os.X_OK)
+    assert '--smtp 127.0.0.1:1025' in unit.read_text()
+    assert '--listen 127.0.0.1:8025' in unit.read_text()
+    assert 'Alias=mailpit.service' in unit.read_text()
+    assert 'host 127.0.0.1\nport 1025' in relay.read_text()
+    assert any(c[:3] == ['systemctl', 'enable', '--now'] for c in sandbox.calls())
+    original = relay.read_bytes()
+    again = sandbox.run('DEBIAN/postinst', 'configure')
+    assert again.returncode == 0, again.stderr
+    assert relay.read_bytes() == original
+    relay.write_text('# user edited relay\n')
+    data = destination / 'var/lib/sites-dashboard-mailpit/mailpit.db'
+    data.parent.mkdir(parents=True, exist_ok=True)
+    data.write_bytes(b'mail and databases must remain')
+    removed = sandbox.run('DEBIAN/prerm', 'remove')
+    assert removed.returncode == 0, removed.stderr
+    assert data.read_bytes() == b'mail and databases must remain'
+    assert relay.read_text() == '# user edited relay\n'
+    assert not binary.exists()
+
+
+def test_uninstall_retry_after_modules_are_partly_removed_uses_journal(sandbox):
+    data = installed(sandbox)
+    app = Path(data['app'])
+    sandbox.env['MOCK_UNLINK_TARGET'] = str(app / 'bin/sites_config.py')
+    result = sandbox.run('uninstall.sh')
+    assert result.returncode != 0
+    assert not (app / 'bin/sites_platform.py').exists()
+    assert (app / 'uninstall.sh').exists()
+    assert json.loads((sandbox.state / 'runtime.json').read_text())['cleanup_runtime_done']
+    sandbox.env.pop('MOCK_UNLINK_TARGET')
+    result = RUN([str(sandbox.bin / 'bash'), str(app / 'uninstall.sh')],
+                 env={**sandbox.env, 'MOCK_INSTALLED_ONLY': '1'}, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert json.loads((sandbox.state / 'runtime.json').read_text())['uninstalled']
+
+
+def test_debian_rejects_download_checksum_mismatch(sandbox):
+    sandbox.env.update(MOCK_OS='Linux', MOCK_ARCH='x86_64', MOCK_BAD_MAILPIT_DOWNLOAD='1',
+                       MOCK_SYSTEM_ROOT=str(sandbox.root / 'system'))
+    result = sandbox.run('DEBIAN/postinst', 'configure')
+    assert result.returncode != 0
+    assert 'checksum' in result.stderr
+    assert not (sandbox.root / 'system/var/lib/sites-dashboard/bin/mailpit').exists()
+    assert not any('enable' in c for c in sandbox.calls())
+
+
+def test_replacement_recovery_preserves_intervening_user_edit(sandbox):
+    data = installed(sandbox)
+    target = Path(data['app']) / 'bin/sites_config.py'
+    updated = target.read_bytes() + b'\nUPGRADED = True\n'
+    (sandbox.source / 'bin/sites_config.py').write_bytes(updated)
+    sandbox.env.update(MOCK_REPLACE_TARGET=str(target), MOCK_REPLACE_PHASE='before')
+    assert sandbox.run().returncode != 0
+    sandbox.env.pop('MOCK_REPLACE_TARGET')
+    edited = target.read_bytes() + b'\nUSER_EDIT = True\n'
+    target.write_bytes(edited)
+    assert sandbox.run().returncode != 0
+    result = sandbox.run('uninstall.sh')
+    assert result.returncode == 0, result.stderr
+    assert target.read_bytes() == edited
