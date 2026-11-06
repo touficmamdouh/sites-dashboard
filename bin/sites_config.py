@@ -29,7 +29,8 @@ def load_config(env: Mapping[str, str] | None = None, runtime: RuntimePaths | No
     return RuntimeConfig(
         runtime=paths,
         webroot=expand_path(values.get("SITES_WEBROOT") or "~/www", values),
-        backup_dir=expand_path(values.get("SITES_BACKUP_DIR") or "~/backups", values),
+        # Keep the documented override ahead of the newer directory alias.
+        backup_dir=expand_path(values.get("SITES_BACKUP") or values.get("SITES_BACKUP_DIR") or "~/backups", values),
         web_user=owner,
         web_group=values.get("SITES_WEB_GROUP") or paths.runtime_group,
         db_root_user=values.get("SITES_DB_ROOT_USER") or "root",

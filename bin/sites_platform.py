@@ -118,7 +118,7 @@ class _LinuxAdapter:
         if not service:
             raise RuntimeError("No PHP-FPM service found. Install PHP-FPM or set SITES_PHP_SERVICE and SITES_PHP_SOCK.")
         socket, binary = cls.php_paths(service)
-        if not _php_override(env) and not env.get("SITES_PHP_SOCK"):
+        if not env.get("SITES_PHP_SOCK"):
             result = runner([str(binary), "-tt"])
             if not result.returncode:
                 socket = _socket_from_dump(result, service)

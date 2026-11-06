@@ -3,13 +3,14 @@ from pathlib import Path
 import pytest
 
 from sites_config import load_config
-from sites_platform import detect_runtime
+from sites_platform import CommandResult, detect_runtime
 
 
 @pytest.fixture
 def runtime(host, fake_runner):
     host("Linux")
-    return detect_runtime({"SITES_PHP_SERVICE": "php8.3-fpm"}, fake_runner({}))
+    runner = fake_runner({("/usr/sbin/php-fpm8.3", "-tt"): CommandResult("", "unavailable", 127)})
+    return detect_runtime({"SITES_PHP_SERVICE": "php8.3-fpm"}, runner)
 
 
 def test_defaults_use_current_home(runtime, monkeypatch, tmp_path):
@@ -62,7 +63,8 @@ def test_new_php_override_beats_legacy_override(runtime):
 def test_nginx_prefix_override_is_shared_by_detection_and_config(host, fake_runner):
     host("Linux")
     env = {"SITES_PHP_SERVICE": "php8.3-fpm", "SITES_NGINX_PREFIX": "/managed/nginx"}
-    runtime = detect_runtime(env, fake_runner({}))
+    runner = fake_runner({("/usr/sbin/php-fpm8.3", "-tt"): CommandResult("", "unavailable", 127)})
+    runtime = detect_runtime(env, runner)
     assert runtime.nginx_available == Path("/managed/nginx/sites-available")
     assert load_config(env, runtime).runtime.nginx_enabled == Path("/managed/nginx/sites-enabled")
 
@@ -82,3 +84,15 @@ def test_config_without_runtime_delegates_detection(monkeypatch, runtime):
 
 def test_empty_database_password_is_preserved(runtime):
     assert load_config({"SITES_DB_ROOT_PASS": ""}, runtime).db_root_pass == ""
+
+
+@pytest.mark.parametrize("overrides,expected", [
+    ({"SITES_BACKUP": "~/legacy-backups"}, "/Users/alice/legacy-backups"),
+    ({"SITES_BACKUP_DIR": "/alias/backups"}, "/alias/backups"),
+    ({"SITES_BACKUP": "/existing/backups", "SITES_BACKUP_DIR": "/alias/backups"}, "/existing/backups"),
+    ({"SITES_BACKUP": "", "SITES_BACKUP_DIR": "/alias/backups"}, "/alias/backups"),
+    ({"SITES_BACKUP": "", "SITES_BACKUP_DIR": ""}, "/Users/alice/backups"),
+])
+def test_backup_override_alias_precedence(runtime, overrides, expected):
+    config = load_config({"HOME": "/Users/alice", **overrides}, runtime)
+    assert config.backup_dir == Path(expected)

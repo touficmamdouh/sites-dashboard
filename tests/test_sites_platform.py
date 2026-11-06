@@ -149,7 +149,8 @@ def mac_runtime(host, fake_runner):
 @pytest.fixture
 def linux_runtime(host, fake_runner):
     host("Linux")
-    return detect_runtime({"SITES_PHP_SERVICE": "php8.3-fpm"}, fake_runner({}))
+    runner = fake_runner({("/usr/sbin/php-fpm8.3", "-tt"): CommandResult("", "unavailable", 127)})
+    return detect_runtime({"SITES_PHP_SERVICE": "php8.3-fpm"}, runner)
 
 
 @pytest.mark.parametrize("method,persistent,commands", [
@@ -238,6 +239,30 @@ def test_linux_discovers_configured_socket_for_active_php(host, fake_runner):
             CommandResult("", "[notice] listen = /tmp/phpwebstudy-php-cgi-85.sock\n", 0),
     })
     assert detect_runtime({}, runner).php_socket == Path("/tmp/phpwebstudy-php-cgi-85.sock")
+
+
+@pytest.mark.parametrize("variable", ["SITES_PHP_SERVICE", "SITES_PHP_SVC"])
+def test_explicit_linux_php_discovers_configured_socket(host, fake_runner, variable):
+    host("Linux")
+    runner = fake_runner({
+        ("/usr/sbin/php-fpm8.5", "-tt"):
+            CommandResult("", "[notice] listen = /tmp/selected-php.sock\n", 0),
+    })
+    runtime = detect_runtime({variable: "php8.5-fpm"}, runner)
+    assert runtime.php_service == "php8.5-fpm"
+    assert runtime.php_socket == Path("/tmp/selected-php.sock")
+    assert runner.calls == [("/usr/sbin/php-fpm8.5", "-tt")]
+
+
+@pytest.mark.parametrize("returncode", [1, 127])
+def test_explicit_linux_php_keeps_conventional_socket_when_probe_fails(host, fake_runner, returncode):
+    host("Linux")
+    runner = fake_runner({
+        ("/usr/sbin/php-fpm8.5", "-tt"): CommandResult("", "cannot dump configuration", returncode),
+    })
+    runtime = detect_runtime({"SITES_PHP_SERVICE": "php8.5-fpm"}, runner)
+    assert runtime.php_socket == Path("/run/php/php8.5-fpm.sock")
+    assert runner.calls == [("/usr/sbin/php-fpm8.5", "-tt")]
 
 
 def test_php_socket_path_with_spaces_is_preserved(host, fake_runner):
