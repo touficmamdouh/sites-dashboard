@@ -15,12 +15,19 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, List
 
-SITES_AVAILABLE = Path("/etc/nginx/sites-available")
-SITES_ENABLED = Path("/etc/nginx/sites-enabled")
-WEBROOT = Path("/home/t9/www")
-BACKUP_DIR = Path("/home/t9/backups")
-WP_USER = "www-data"
-WP_GROUP = "www-data"
+from sites_config import RuntimeConfig, load_config
+from sites_platform import ServiceManager
+
+RUNTIME: Optional[RuntimeConfig] = None
+
+
+def get_runtime(runtime: Optional[RuntimeConfig] = None) -> RuntimeConfig:
+    global RUNTIME
+    if runtime is not None:
+        return runtime
+    if RUNTIME is None:
+        RUNTIME = load_config()
+    return RUNTIME
 
 
 def run(cmd: list, timeout: int = 15) -> tuple[str, str, int]:
@@ -37,12 +44,13 @@ def pkexec(cmd: list) -> tuple[str, str, int]:
     return run(["sudo", "-n"] + cmd)
 
 
-def get_site_info(name: str) -> dict:
-    conf = SITES_AVAILABLE / f"{name}.conf"
+def get_site_info(name: str, runtime: Optional[RuntimeConfig] = None) -> dict:
+    runtime = get_runtime(runtime)
+    conf = runtime.runtime.nginx_available / f"{name}.conf"
     info = {"name": name, "enabled": False, "php": "-", "type": "site", "root": "", "domain": name}
     if not conf.exists():
         return info
-    if (SITES_ENABLED / f"{name}.conf").exists():
+    if (runtime.runtime.nginx_enabled / f"{name}.conf").exists():
         info["enabled"] = True
     text = conf.read_text()
     m = re.search(r"root\s+(\S+);", text)
@@ -51,7 +59,13 @@ def get_site_info(name: str) -> dict:
     m = re.search(r"fastcgi_pass\s+unix:([^;]+)", text)
     if m:
         sock = m.group(1)
-        info["php"] = "8.5" if "85" in sock else "8.3"
+        service = runtime.runtime.php_service
+        version = re.search(r"(?:php@?)(\d+\.\d+)", service)
+        socket_version = re.search(r"php(\d+\.\d+)", sock)
+        if sock == str(runtime.runtime.php_socket):
+            info["php"] = version[1] if version else service
+        else:
+            info["php"] = socket_version[1] if socket_version else sock
     if info["root"]:
         rp = Path(info["root"])
         if (rp / "wp-config.php").exists() or (rp / "wp-admin").exists():
@@ -63,30 +77,28 @@ def get_site_info(name: str) -> dict:
     return info
 
 
-def get_all_sites() -> list:
+def get_all_sites(runtime: Optional[RuntimeConfig] = None) -> list:
+    runtime = get_runtime(runtime)
     sites = []
-    if not SITES_AVAILABLE.exists():
+    if not runtime.runtime.nginx_available.exists():
         return sites
-    for f in sorted(SITES_AVAILABLE.glob("*.conf")):
-        sites.append(get_site_info(f.stem))
+    for f in sorted(runtime.runtime.nginx_available.glob("*.conf")):
+        sites.append(get_site_info(f.stem, runtime))
     return sites
 
 
-def get_service_status() -> list:
+def get_service_status(runtime: Optional[RuntimeConfig] = None, runner=None) -> list:
+    runtime = get_runtime(runtime)
+    manager = ServiceManager(runtime.runtime, runner)
     services = [
         ("nginx", "Port 80/443"),
         ("mailpit", "UI http://127.0.0.1:8025"),
         ("mariadb", "Port 3306"),
-        ("php8.3-fpm", "Socket /run/php/php8.3-fpm.sock"),
+        (runtime.runtime.php_service, f"Socket {runtime.runtime.php_socket}"),
     ]
-    php85_path = Path("/etc/systemd/system/php8.5-fpm.service")
-    if php85_path.exists():
-        services.append(("php8.5-fpm", "Socket /tmp/phpwebstudy-php-cgi-85.sock"))
-
     result = []
     for name, info in services:
-        out, _, rc = run(["systemctl", "is-active", name])
-        status = out.strip() if out else "inactive"
+        status = manager.status(name)
         result.append({"name": name, "status": status, "info": info})
     return result
 
@@ -170,13 +182,13 @@ def cli_check():
     console.print(table)
 
 
-def cli_services():
+def cli_services(runtime: Optional[RuntimeConfig] = None, runner=None):
     from rich.console import Console
     from rich.table import Table
     from rich import box
 
     console = Console()
-    svcs = get_service_status()
+    svcs = get_service_status(runtime, runner)
     table = Table(box=box.ROUNDED, title="[bold]Services[/bold]")
     table.add_column("Service", style="cyan")
     table.add_column("Status", style="bold")
@@ -196,11 +208,11 @@ def cli_services():
 def cli_enable(name: str):
     from rich.console import Console
     console = Console()
-    conf = SITES_AVAILABLE / f"{name}.conf"
+    conf = get_runtime().runtime.nginx_available / f"{name}.conf"
     if not conf.exists():
         console.print(f"[red]Error:[/red] {name}.conf not found")
         return
-    link = SITES_ENABLED / f"{name}.conf"
+    link = get_runtime().runtime.nginx_enabled / f"{name}.conf"
     if link.exists():
         console.print(f"[yellow]{name} is already enabled[/yellow]")
         return
@@ -218,7 +230,7 @@ def cli_enable(name: str):
 def cli_disable(name: str):
     from rich.console import Console
     console = Console()
-    link = SITES_ENABLED / f"{name}.conf"
+    link = get_runtime().runtime.nginx_enabled / f"{name}.conf"
     if not link.exists():
         console.print(f"[yellow]{name} is already disabled[/yellow]")
         return
@@ -233,52 +245,56 @@ def cli_disable(name: str):
         console.print(f"[red]Nginx reload failed:[/red] {err}")
 
 
-def cli_start():
+def cli_start(runtime: Optional[RuntimeConfig] = None, runner=None):
     from rich.console import Console
     console = Console()
     with console.status("[bold]Starting services..."):
-        pkexec(["systemctl", "start", "mariadb"])
-        pkexec(["systemctl", "start", "mailpit"])
-        pkexec(["systemctl", "start", "php8.3-fpm"])
-        if Path("/etc/systemd/system/php8.5-fpm.service").exists():
-            pkexec(["systemctl", "start", "php8.5-fpm"])
-        pkexec(["systemctl", "start", "nginx"])
+        if not service_action("start", runtime=runtime, runner=runner):
+            return
     console.print("[green]All services started[/green]")
-    cli_services()
+    cli_services(runtime, runner)
 
 
-def cli_stop():
+def cli_stop(runtime: Optional[RuntimeConfig] = None, runner=None):
     from rich.console import Console
     console = Console()
     with console.status("[bold]Stopping services..."):
-        pkexec(["systemctl", "stop", "nginx"])
-        pkexec(["systemctl", "stop", "php8.3-fpm"])
-        if Path("/etc/systemd/system/php8.5-fpm.service").exists():
-            pkexec(["systemctl", "stop", "php8.5-fpm"])
-        pkexec(["systemctl", "stop", "mailpit"])
-        pkexec(["systemctl", "stop", "mariadb"])
+        if not service_action("stop", runtime=runtime, runner=runner):
+            return
     console.print("[yellow]All services stopped[/yellow]")
-    cli_services()
+    cli_services(runtime, runner)
 
 
-def cli_restart(target: Optional[str] = None):
+def cli_restart(target: Optional[str] = None, runtime: Optional[RuntimeConfig] = None, runner=None):
     from rich.console import Console
     console = Console()
     if target:
         console.print(f"[bold]Restarting {target}...[/bold]")
-        pkexec(["systemctl", "reload", "nginx"])
-        pkexec(["systemctl", "reload", "php8.3-fpm"])
+        if not service_action("restart", target, runtime, runner):
+            return
         console.print(f"[green]{target} restarted[/green]")
     else:
         with console.status("[bold]Restarting all services..."):
-            pkexec(["systemctl", "restart", "mariadb"])
-            pkexec(["systemctl", "restart", "mailpit"])
-            pkexec(["systemctl", "restart", "php8.3-fpm"])
-            if Path("/etc/systemd/system/php8.5-fpm.service").exists():
-                pkexec(["systemctl", "restart", "php8.5-fpm"])
-            pkexec(["systemctl", "restart", "nginx"])
+            if not service_action("restart", runtime=runtime, runner=runner):
+                return
         console.print("[green]All services restarted[/green]")
-        cli_services()
+        cli_services(runtime, runner)
+
+
+def service_action(action, target=None, runtime=None, runner=None) -> bool:
+    from rich.console import Console
+    runtime = get_runtime(runtime)
+    manager = ServiceManager(runtime.runtime, runner)
+    services = [target] if target else ["mariadb", "mailpit", runtime.runtime.php_service, "nginx"]
+    if action == "stop":
+        services.reverse()
+    success = True
+    for service in services:
+        result = getattr(manager, action)(service)
+        if result.returncode:
+            Console().print(f"[red]Error {action} {service}:[/red] {result.stderr or result.stdout}")
+            success = False
+    return success
 
 
 # ============= Site Creation =============
@@ -288,8 +304,12 @@ def cli_create(domain: str, wp: bool = False):
     from rich.console import Console
     console = Console()
 
-    newsite = Path.home() / ".local/bin/newsite"
-    if not newsite.exists():
+    override = os.environ.get("SITES_NEWSITE")
+    sibling = Path(__file__).resolve().with_name("newsite")
+    newsite = Path(override).expanduser() if override else (
+        sibling if sibling.is_file() and os.access(sibling, os.X_OK) else shutil.which("newsite")
+    )
+    if not newsite or not Path(newsite).is_file() or not os.access(newsite, os.X_OK):
         console.print("[red]Error:[/red] newsite script not found")
         return
 
@@ -306,7 +326,7 @@ def cli_create(domain: str, wp: bool = False):
             console.print(result.stdout)
         # Fix WordPress permissions after creation
         if wp:
-            site_path = WEBROOT / domain
+            site_path = get_runtime().webroot / domain
             if site_path.exists():
                 fix_wp_permissions(site_path)
                 console.print(f"[green]✓ Permissions fixed for {domain}[/green]")
@@ -364,34 +384,35 @@ def fix_wp_permissions(site_path: Path) -> bool:
     if not site_path.exists():
         return False
 
-    # Add the site owner to www-data's group if not already
-    run(["sudo", "-n", "usermod", "-aG", WP_GROUP, Path.home().name])
+    runtime = get_runtime()
+    if runtime.runtime.platform == "linux":
+        run(["sudo", "-n", "usermod", "-aG", runtime.web_group, runtime.web_user])
 
     # Fix group ownership and permissions for wp-content
     wp_content = site_path / "wp-content"
     if wp_content.exists():
-        pkexec(["chgrp", "-R", WP_GROUP, str(wp_content)])
+        pkexec(["chgrp", "-R", runtime.web_group, str(wp_content)])
         pkexec(["chmod", "-R", "775", str(wp_content)])
 
     # Fix uploads directory specifically
     uploads = wp_content / "uploads"
     if uploads.exists():
-        pkexec(["chgrp", "-R", WP_GROUP, str(uploads)])
+        pkexec(["chgrp", "-R", runtime.web_group, str(uploads)])
         pkexec(["chmod", "-R", "775", str(uploads)])
 
     # Fix upgrade directory
     upgrade = wp_content / "upgrade"
     if upgrade.exists():
-        pkexec(["chgrp", "-R", WP_GROUP, str(upgrade)])
+        pkexec(["chgrp", "-R", runtime.web_group, str(upgrade)])
         pkexec(["chmod", "-R", "775", str(upgrade)])
 
     # Fix plugin storage directories for ai1wm-backups
     for storage_dir in site_path.rglob("ai1wm-backups"):
-        pkexec(["chgrp", "-R", WP_GROUP, str(storage_dir)])
+        pkexec(["chgrp", "-R", runtime.web_group, str(storage_dir)])
         pkexec(["chmod", "-R", "775", str(storage_dir)])
 
     for storage_dir in site_path.rglob("all-in-one-wp-migration/storage"):
-        pkexec(["chgrp", "-R", WP_GROUP, str(storage_dir)])
+        pkexec(["chgrp", "-R", runtime.web_group, str(storage_dir)])
         pkexec(["chmod", "-R", "775", str(storage_dir)])
 
     return True
@@ -423,7 +444,7 @@ def fix_all_permissions():
 
 def ensure_backup_dir(site: str) -> Path:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    p = BACKUP_DIR / site / ts
+    p = get_runtime().backup_dir / site / ts
     p.mkdir(parents=True, exist_ok=True)
     return p
 
@@ -467,7 +488,7 @@ def restore_site(site: str, backup_path: Path):
     root = get_site_root(site)
     if not root:
         # Try to create the directory
-        root = WEBROOT / site
+        root = get_runtime().webroot / site
         root.mkdir(parents=True, exist_ok=True)
 
     meta_file = backup_path / "backup.json"
@@ -540,7 +561,7 @@ def cli_snapshot(site: str):
         console.print(f"[red]Error:[/red] site '{site}' not found")
         return
 
-    snap_dir = BACKUP_DIR / site / "snapshot"
+    snap_dir = get_runtime().backup_dir / site / "snapshot"
     if snap_dir.exists():
         shutil.rmtree(snap_dir)
     snap_dir.mkdir(parents=True)
@@ -564,7 +585,7 @@ def cli_update_wp(site: str):
 
     with console.status(f"[bold]Updating WordPress for {site}..."):
         # Snapshot first
-        snap_dir = BACKUP_DIR / site / "pre-update"
+        snap_dir = get_runtime().backup_dir / site / "pre-update"
         if snap_dir.exists():
             shutil.rmtree(snap_dir)
         backup_site(site, snap_dir)
@@ -675,7 +696,7 @@ def cli_ssl(site: str):
                 console.print(f"[red]mkcert failed:[/red] {err or out}")
                 return
         # Update Nginx config
-        conf = SITES_AVAILABLE / f"{site}.conf"
+        conf = get_runtime().runtime.nginx_available / f"{site}.conf"
         if conf.exists():
             text = conf.read_text()
             ssl_block = (
@@ -743,7 +764,7 @@ def cli_export(site: str):
         backup_site(site, export_dir)
 
         # Copy nginx config
-        conf = SITES_AVAILABLE / f"{site}.conf"
+        conf = get_runtime().runtime.nginx_available / f"{site}.conf"
         if conf.exists():
             shutil.copy(conf, export_dir / "nginx.conf")
 
@@ -1018,6 +1039,7 @@ def run_dashboard():
                 text.append(f"{dot} ", style=color)
                 text.append(f"{svc['name']} ", style="bold")
                 text.append(f"[{svc['status']}]", style=color)
+                text.append(f" {svc['info']}")
             self.query_one("#svc-status", Static).update(text)
 
         def update_sites(self):
@@ -1031,7 +1053,7 @@ def run_dashboard():
                 type_color = {"WP": "green", "CI": "yellow", "site": "cyan"}
                 stype = f"[{type_color.get(s['type'], 'white')}]{s['type']}[/{type_color.get(s['type'], 'white')}]"
 
-                root = s["root"].replace(str(WEBROOT) + "/", "") if s["root"] else "-"
+                root = s["root"].replace(str(get_runtime().webroot) + "/", "") if s["root"] else "-"
                 status_text = Text.from_markup(status)
                 http_text = Text.from_markup(http)
                 type_text = Text.from_markup(stype)
@@ -1074,7 +1096,7 @@ def run_dashboard():
                 else:
                     http = "-"
                 info = get_site_info(name)
-                root = info["root"].replace(str(WEBROOT) + "/", "") if info["root"] else "-"
+                root = info["root"].replace(str(get_runtime().webroot) + "/", "") if info["root"] else "-"
                 type_color = {"WP": "green", "CI": "yellow", "site": "cyan"}
                 stype = f"[{type_color.get(info['type'], 'white')}]{info['type']}[/{type_color.get(info['type'], 'white')}]"
                 status_text = Text.from_markup(status)
@@ -1143,7 +1165,7 @@ def run_dashboard():
             elif action == "snapshot":
                 cli_snapshot(site)
             elif action == "restore":
-                site_dir = BACKUP_DIR / site
+                site_dir = get_runtime().backup_dir / site
                 if not site_dir.exists():
                     console.log(f"[red]No backups found for {site}[/red]")
                     return
@@ -1225,6 +1247,14 @@ def main():
         no_args_is_help=True,
     )
 
+    @app.callback()
+    def initialize():
+        try:
+            get_runtime()
+        except RuntimeError as error:
+            typer.echo(f"Error: {error}", err=True)
+            raise typer.Exit(1)
+
     @app.command()
     def list():
         """List all sites with status"""
@@ -1262,8 +1292,8 @@ def main():
 
     @app.command()
     def restart(
-        name: Optional[str] = typer.Argument(None, help="Site name (optional)")):
-        """Restart services or a specific site"""
+        name: Optional[str] = typer.Argument(None, help="Service name (optional)")):
+        """Restart all services or a named service"""
         cli_restart(name)
 
     @app.command()
