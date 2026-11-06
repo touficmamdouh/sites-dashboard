@@ -78,3 +78,7 @@ def test_config_without_runtime_delegates_detection(monkeypatch, runtime):
     env = {"HOME": "/Users/alice"}
     assert load_config(env).runtime == runtime
     assert seen == [env]
+
+
+def test_empty_database_password_is_preserved(runtime):
+    assert load_config({"SITES_DB_ROOT_PASS": ""}, runtime).db_root_pass == ""

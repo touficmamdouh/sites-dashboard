@@ -79,6 +79,19 @@ def _brew_services(brew: Path, runner: CommandRunner) -> list[dict]:
     return services
 
 
+def _socket_from_dump(result: CommandResult, service: str) -> Path:
+    # php-fpm writes its configuration dump to stderr, including notices.
+    listeners = re.findall(r"(?m)\blisten\s*=\s*([^\n]+)", result.stdout + "\n" + result.stderr)
+    listeners = [value.strip() for value in listeners]
+    sockets = set(value for value in listeners if value.startswith("/"))
+    if result.returncode or len(sockets) != 1 or any(not value.startswith("/") for value in listeners):
+        raise RuntimeError(
+            f"Cannot resolve a single PHP-FPM Unix socket for {service}. "
+            "Configure the PHP-FPM pool listen path or set SITES_PHP_SOCK explicitly."
+        )
+    return Path(sockets.pop())
+
+
 class _LinuxAdapter:
     @staticmethod
     def php_paths(service: str) -> tuple[Path, Path]:
@@ -105,6 +118,10 @@ class _LinuxAdapter:
         if not service:
             raise RuntimeError("No PHP-FPM service found. Install PHP-FPM or set SITES_PHP_SERVICE and SITES_PHP_SOCK.")
         socket, binary = cls.php_paths(service)
+        if not _php_override(env) and not env.get("SITES_PHP_SOCK"):
+            result = runner([str(binary), "-tt"])
+            if not result.returncode:
+                socket = _socket_from_dump(result, service)
         runtime = RuntimePaths(
             "linux", platform.machine(), None,
             Path("/etc/nginx/sites-available"), Path("/etc/nginx/sites-enabled"),
@@ -167,15 +184,7 @@ class _MacOSAdapter:
         socket = env.get("SITES_PHP_SOCK")
         if not socket:
             result = runner([str(binary), "-tt"])
-            # php-fpm writes its configuration dump to stderr, including notices.
-            listeners = re.findall(r"\blisten\s*=\s*(\S+)", result.stdout + "\n" + result.stderr)
-            sockets = set(value for value in listeners if value.startswith("/"))
-            if result.returncode or len(sockets) != 1 or any(not value.startswith("/") for value in listeners):
-                raise RuntimeError(
-                    f"Cannot resolve a single PHP-FPM Unix socket for {service}. "
-                    "Configure the PHP-FPM pool listen path or set SITES_PHP_SOCK explicitly."
-                )
-            socket = sockets.pop()
+            socket = str(_socket_from_dump(result, service))
         user = env.get("SUDO_USER") or env.get("USER") or getpass.getuser()
         runtime = RuntimePaths(
             "macos", platform.machine(), prefix,

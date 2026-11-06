@@ -47,6 +47,7 @@ def test_detect_linux_keeps_existing_nginx_paths(host, fake_runner):
     runner = fake_runner({
         ("systemctl", "list-units", "--all", "--type=service", "--no-legend", "--no-pager"):
             "php8.2-fpm.service loaded inactive dead PHP\nphp8.3-fpm.service loaded active running PHP\n",
+        ("/usr/sbin/php-fpm8.3", "-tt"): CommandResult("", "unavailable", 127),
     })
     runtime = detect_runtime({}, runner)
     assert runtime.platform == "linux"
@@ -129,6 +130,7 @@ def test_linux_installed_php_fallback(host, fake_runner):
         ("systemctl", "list-units", "--all", "--type=service", "--no-legend", "--no-pager"): "",
         ("systemctl", "list-unit-files", "--type=service", "--no-legend", "--no-pager"):
             "php8.4-fpm.service enabled enabled\n",
+        ("/usr/sbin/php-fpm8.4", "-tt"): CommandResult("", "unavailable", 127),
     })
     assert detect_runtime({}, runner).php_socket == Path("/run/php/php8.4-fpm.sock")
 
@@ -225,6 +227,69 @@ def test_command_failure_stops_sequence(linux_runtime, fake_runner):
     runner = fake_runner({("sudo", "-n", "systemctl", "enable", "nginx"): failed})
     assert ServiceManager(linux_runtime, runner).restart("nginx") == failed
     assert len(runner.calls) == 1
+
+
+def test_linux_discovers_configured_socket_for_active_php(host, fake_runner):
+    host("Linux")
+    runner = fake_runner({
+        ("systemctl", "list-units", "--all", "--type=service", "--no-legend", "--no-pager"):
+            "php8.5-fpm.service loaded active running PHP\n",
+        ("/usr/sbin/php-fpm8.5", "-tt"):
+            CommandResult("", "[notice] listen = /tmp/phpwebstudy-php-cgi-85.sock\n", 0),
+    })
+    assert detect_runtime({}, runner).php_socket == Path("/tmp/phpwebstudy-php-cgi-85.sock")
+
+
+def test_php_socket_path_with_spaces_is_preserved(host, fake_runner):
+    runtime = detect_runtime({}, mac_runner(fake_runner, listen="/tmp/my php.sock"))
+    assert runtime.php_socket == Path("/tmp/my php.sock")
+
+
+@pytest.mark.parametrize("listing", ["not json", "{}", "[null]"])
+def test_invalid_brew_listing_returns_unknown_status(mac_runtime, fake_runner, listing):
+    runner = fake_runner({("/opt/homebrew/bin/brew", "services", "list", "--json"): listing})
+    assert ServiceManager(mac_runtime, runner).status("php@8.3") == "unknown"
+
+
+def test_brew_command_failure_returns_unknown_status(mac_runtime, fake_runner):
+    runner = fake_runner({("/opt/homebrew/bin/brew", "services", "list", "--json"):
+                          CommandResult("", "unavailable", 1)})
+    assert ServiceManager(mac_runtime, runner).status("php@8.3") == "unknown"
+
+
+def test_macos_service_change_requires_matching_socket(mac_runtime):
+    from sites_config import load_config
+
+    with pytest.raises(RuntimeError, match="SITES_PHP_SOCK"):
+        load_config({"SITES_PHP_SERVICE": "php@8.4"}, mac_runtime)
+
+
+def test_transient_brew_restart_preserves_stop_failure(mac_runtime, fake_runner):
+    failed = CommandResult("", "cannot stop", 1)
+    runner = fake_runner({("/opt/homebrew/bin/brew", "services", "stop", "mariadb"): failed})
+    assert ServiceManager(mac_runtime, runner).restart("mariadb", persistent=False) == failed
+    assert len(runner.calls) == 1
+
+
+@pytest.mark.parametrize("method,action", [("start", ("bootstrap", "system", "/Library/LaunchDaemons/com.sites-dashboard.nginx.plist")),
+                                          ("restart", ("kickstart", "-k", "system/com.sites-dashboard.nginx"))])
+def test_transient_nginx_action_does_not_enable(mac_runtime, fake_runner, method, action):
+    command = ("sudo", "-n", "launchctl", *action)
+    runner = fake_runner({command: ""})
+    assert getattr(ServiceManager(mac_runtime, runner), method)("nginx", persistent=False).returncode == 0
+    assert runner.calls == [command]
+
+
+def test_default_runner_preserves_output_and_exit_code(monkeypatch):
+    import subprocess
+
+    def execute(command, **kwargs):
+        assert command == ["example", "literal;argument"]
+        assert kwargs == {"capture_output": True, "text": True, "timeout": 15}
+        return subprocess.CompletedProcess(command, 7, " output\n", " error\n")
+
+    monkeypatch.setattr("subprocess.run", execute)
+    assert run_command(["example", "literal;argument"]) == CommandResult("output", "error", 7)
 
 
 @pytest.mark.parametrize("error,message", [(FileNotFoundError(), "Command not found"), (TimeoutError(), "")])
