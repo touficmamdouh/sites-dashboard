@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 RUN = subprocess.run
 
 FAKE_COMMAND = r'''#!PYTHON
-import hashlib, io, json, os, shutil, sys, tarfile
+import json, os, shutil, sys
 from pathlib import Path
 name = Path(sys.argv[0]).name
 args = sys.argv[1:]
@@ -30,11 +30,14 @@ def owned(path):
     return p
 statefile = root / 'services.json'
 state = json.loads(statefile.read_text()) if statefile.exists() else {}
+config_base = os.environ.get('XDG_CONFIG_HOME') or os.environ.get('HOMEBREW_XDG_CONFIG_HOME')
+brew_config = Path(config_base) / 'homebrew' if config_base else Path(os.environ['HOME']) / '.homebrew'
 if name == 'uname': print(os.environ.get('MOCK_ARCH', 'arm64') if '-m' in args else os.environ.get('MOCK_OS', 'Darwin'))
 elif name == 'sw_vers': print(os.environ.get('MOCK_VERSION', '13.0'))
 elif name == 'id': print('1000')
 elif name == 'brew':
     if args == ['--prefix']: print(brew)
+    elif args == ['ruby', '-e', 'puts ENV.fetch("HOMEBREW_USER_CONFIG_HOME")']: print(brew_config)
     elif args[:2] == ['list', '--versions']:
         if args[-1] not in os.environ.get('MOCK_MISSING_FORMULAE', '').split(','): print(args[-1], '1.0')
         else: sys.exit(1)
@@ -46,7 +49,7 @@ elif name == 'brew':
         if args[1:] == ['restart', 'php'] and os.environ.get('MOCK_PHP_RESTART_FAIL'):
             print('PHP restart failed', file=sys.stderr); sys.exit(1)
         if args[2] == 'mailpit' and args[1] != 'stop':
-            envfile = Path(os.environ['HOME']) / '.homebrew/services/mailpit.env'
+            envfile = brew_config / 'services/mailpit.env'
             values = dict(line.split('=', 1) for line in envfile.read_text().splitlines()
                           if line and not line.startswith('#')) if envfile.exists() else {}
             (root / 'mailpit-bindings.json').write_text(json.dumps([
@@ -99,6 +102,7 @@ elif name == 'curl':
     if 'raw.githubusercontent.com/Homebrew/install/HEAD/install.sh' in ' '.join(args):
         print('echo homebrew-installed >> "$SITES_TEST_ROOT/bootstrap"')
     elif any('github.com/axllent/mailpit/releases/' in arg for arg in args):
+        import hashlib, io, tarfile
         target = owned(args[args.index('--output') + 1])
         data = io.BytesIO()
         with tarfile.open(fileobj=data, mode='w') as archive:
@@ -141,6 +145,16 @@ from pathlib import Path
 import tempfile
 original_replace = Path.replace
 def replace_path(self, destination):
+    fault = os.environ.get('MOCK_FINAL_CHECKPOINT_FAULT')
+    if fault and str(destination).endswith('/.config/sites-dashboard/runtime.json'):
+        data = json.loads(self.read_text())
+        complete = os.environ.get('MOCK_CHECKPOINT_KIND') == 'complete'
+        if data.get('uninstalled') and (not complete or data.get('cleanup_pending') is not True):
+            if fault == 'after':
+                original_replace(self, destination)
+                os._exit(78)
+            if fault == 'before':
+                raise OSError('injected checkpoint publication failure')
     if os.environ.get('MOCK_REPLACE_TARGET') == str(destination):
         if os.environ.get('MOCK_REPLACE_PHASE') == 'after':
             original_replace(self, destination)
@@ -148,6 +162,15 @@ def replace_path(self, destination):
         raise OSError('injected publication failure')
     return original_replace(self, destination)
 Path.replace = replace_path
+import json, stat
+original_fsync = os.fsync
+def fsync(fd):
+    if os.environ.get('MOCK_FINAL_CHECKPOINT_FAULT') == 'directory' and stat.S_ISDIR(os.fstat(fd).st_mode):
+        path = Path(os.environ['HOME']) / '.config/sites-dashboard/runtime.json'
+        if path.exists() and json.loads(path.read_text()).get('uninstalled'):
+            raise OSError('injected checkpoint directory sync failure')
+    return original_fsync(fd)
+os.fsync = fsync
 original_unlink = Path.unlink
 def unlink_path(self, *args, **kwargs):
     if os.environ.get('MOCK_UNLINK_TARGET') == str(self):
@@ -229,6 +252,8 @@ def sandbox(tmp_path):
                         'SITES_TEST_ROOT': str(tmp_path), 'SITES_TEST_SOURCE': str(self.source),
                         'SITES_BREW_PREFIX': str(self.brew), 'REAL_PYTHON': sys.executable,
                         'PYTHONPATH': str(patch), 'TMPDIR': str(tmp_path), 'USER': 'alice'}
+            for name in ('XDG_CONFIG_HOME', 'HOMEBREW_XDG_CONFIG_HOME', 'HOMEBREW_USER_CONFIG_HOME'):
+                self.env.pop(name, None)
             for name in ('bash', 'dirname', 'mkdir', 'install', 'cp', 'chmod', 'rm', 'cat',
                          'grep', 'sed', 'head', 'basename', 'tee', 'tar', 'cut', 'getent',
                          'logname', 'mktemp', 'ln', 'mv', 'ls', 'dpkg-deb', 'sleep'):
@@ -680,3 +705,98 @@ def test_replacement_recovery_preserves_intervening_user_edit(sandbox):
     result = sandbox.run('uninstall.sh')
     assert result.returncode == 0, result.stderr
     assert target.read_bytes() == edited
+
+
+@pytest.mark.parametrize('xdg,brew_xdg,relative', [
+    ('xdg', None, 'xdg/homebrew'),
+    (None, 'brew-xdg', 'brew-xdg/homebrew'),
+    ('xdg', 'brew-xdg', 'xdg/homebrew'),
+    ('', 'brew-xdg', 'brew-xdg/homebrew'),
+    ('', '', 'home alice/.homebrew'),
+])
+def test_mailpit_uses_homebrew_effective_config_directory(sandbox, xdg, brew_xdg, relative):
+    for name, value in [('XDG_CONFIG_HOME', xdg), ('HOMEBREW_XDG_CONFIG_HOME', brew_xdg)]:
+        if value is not None:
+            sandbox.env[name] = str(sandbox.root / value) if value else ''
+    # Homebrew derives this variable itself, ignoring stale inherited values.
+    sandbox.env['HOMEBREW_USER_CONFIG_HOME'] = str(sandbox.root / 'stale-config')
+    data = installed(sandbox)
+    envfile = sandbox.root / relative / 'services/mailpit.env'
+    assert envfile.is_file()
+    assert str(envfile) in data['owned_files']
+    assert not (sandbox.root / 'stale-config/services/mailpit.env').exists()
+    result = RUN([str(sandbox.brew / 'bin/brew'), 'services', 'restart', 'mailpit'],
+                 env=sandbox.env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert json.loads((sandbox.root / 'mailpit-bindings.json').read_text()) == ['127.0.0.1:1025', '127.0.0.1:8025']
+
+
+def test_mailpit_validates_existing_settings_in_effective_config_directory(sandbox):
+    sandbox.env['XDG_CONFIG_HOME'] = str(sandbox.root / 'xdg')
+    envfile = sandbox.root / 'xdg/homebrew/services/mailpit.env'
+    envfile.parent.mkdir(parents=True)
+    content = 'MP_SMTP_BIND_ADDR=0.0.0.0:1025\nMP_UI_BIND_ADDR=0.0.0.0:8025\n'
+    envfile.write_text(content)
+    result = sandbox.run()
+    assert result.returncode != 0
+    assert envfile.read_text() == content
+    assert not any(c[:4] == ['brew', 'services', 'start', 'mailpit'] for c in sandbox.calls())
+
+
+@pytest.mark.parametrize('kind,phase', [
+    ('prepare', 'before'), ('prepare', 'after'), ('prepare', 'directory'),
+    ('complete', 'before'), ('complete', 'after'),
+])
+def test_uninstall_checkpoint_failure_keeps_installed_retry_entrypoint(sandbox, kind, phase):
+    data = installed(sandbox)
+    app = Path(data['app'])
+    sandbox.env.update(MOCK_FINAL_CHECKPOINT_FAULT=phase, MOCK_CHECKPOINT_KIND=kind)
+    failed = sandbox.run('uninstall.sh')
+    assert failed.returncode != 0, failed.stdout + failed.stderr
+    assert (app / 'uninstall.sh').is_file()
+    if kind == 'prepare':
+        assert (app / 'bin/sites_platform.py').is_file()
+        assert (app / 'venv/bin/python').is_file()
+    sandbox.env.pop('MOCK_FINAL_CHECKPOINT_FAULT')
+    result = RUN([str(sandbox.bin / 'bash'), str(app / 'uninstall.sh')],
+                 env={**sandbox.env, 'MOCK_INSTALLED_ONLY': '1'}, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    completed = json.loads((sandbox.state / 'runtime.json').read_text())
+    assert completed['uninstalled'] and not completed.get('cleanup_pending')
+    assert not (app / 'uninstall.sh').exists()
+
+
+def test_retry_entrypoint_unlink_failure_has_durable_completion_record(sandbox):
+    data = installed(sandbox)
+    script = Path(data['app']) / 'uninstall.sh'
+    sandbox.env['MOCK_UNLINK_TARGET'] = str(script)
+    result = sandbox.run('uninstall.sh')
+    assert result.returncode != 0
+    assert script.is_file()
+    completed = json.loads((sandbox.state / 'runtime.json').read_text())
+    assert completed['uninstalled'] and not completed.get('cleanup_pending')
+    sandbox.env.pop('MOCK_UNLINK_TARGET')
+    result = RUN([str(sandbox.bin / 'bash'), str(script)],
+                 env={**sandbox.env, 'MOCK_INSTALLED_ONLY': '1'}, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert not script.exists()
+
+
+@pytest.mark.parametrize('phase', ['before', 'after'])
+def test_interrupted_upgrade_then_uninstall_then_reinstall_retires_journal(sandbox, phase):
+    data = installed(sandbox)
+    target = Path(data['app']) / 'bin/sites_config.py'
+    (sandbox.source / 'bin/sites_config.py').write_bytes(target.read_bytes() + b'\nROUND_TWO = True\n')
+    sandbox.env.update(MOCK_REPLACE_TARGET=str(target), MOCK_REPLACE_PHASE=phase)
+    assert sandbox.run().returncode != 0
+    pending = json.loads((sandbox.state / 'runtime.json').read_text())['pending_files']
+    assert str(target) in pending
+    staged = Path(pending[str(target)]['temporary'])
+    sandbox.env.pop('MOCK_REPLACE_TARGET')
+    result = sandbox.run('uninstall.sh')
+    assert result.returncode == 0, result.stderr
+    assert not target.exists() and not staged.exists()
+    removed = json.loads((sandbox.state / 'runtime.json').read_text())
+    assert not removed.get('pending_files')
+    data = installed(sandbox)
+    assert data['ready'] and not data['uninstalled']

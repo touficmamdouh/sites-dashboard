@@ -25,7 +25,7 @@ if not path.exists():
     print('No recorded source installation. For a Debian package use: sudo apt-get remove sites-dashboard')
     sys.exit(0)
 metadata = json.loads(path.read_text())
-if metadata.get('uninstalled'):
+if metadata.get('uninstalled') and not metadata.get('cleanup_pending') and not (Path(metadata['app']) / 'uninstall.sh').exists():
     print('Already uninstalled; retained user data and runtime metadata.')
     sys.exit(0)
 app = Path(metadata['app'])
@@ -55,31 +55,47 @@ def save():
         temporary = Path(f.name)
     temporary.chmod(0o600)
     temporary.replace(path)
+    sync_directory(state)
+
+
+def sync_directory(directory):
+    fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 retained = []
 
 
-def remove_owned(filename, expected):
+def remove_owned(filename, expected, keep=False):
     target = Path(filename)
     pending = metadata.get('pending_files', {}).get(str(target), {})
     valid = {expected, pending.get('old'), pending.get('new')} - {None}
     if target.is_symlink() or (target.exists() and hashlib.sha256(target.read_bytes()).hexdigest() not in valid):
         retained.append(str(target))
         return False
-    target.unlink(missing_ok=True)
+    if keep:
+        if target.exists():
+            metadata['owned_files'][str(target)] = hashlib.sha256(target.read_bytes()).hexdigest()
+    else:
+        target.unlink(missing_ok=True)
     if pending:
         temporary = Path(pending['temporary'])
         if temporary.parent != target.parent or not temporary.name.startswith('.sites-dashboard-') or temporary.is_symlink():
             raise RuntimeError('Invalid replacement staging path: ' + str(temporary))
         temporary.unlink(missing_ok=True)
+        sync_directory(target.parent)
+        del metadata['pending_files'][str(target)]
+        save()
     return True
 
 
 try:
     # After system cleanup is journaled, retries need only the standard library,
     # even if a later unlink or partial venv removal interrupted the final phase.
-    if not metadata.get('cleanup_runtime_done'):
+    if not metadata.get('uninstalled') and not metadata.get('cleanup_runtime_done'):
         sys.path.insert(0, str(app / 'bin'))
         from sites_platform import RuntimePaths, ServiceManager, _owned_nginx_plist
         values = dict(metadata['runtime'])
@@ -125,6 +141,8 @@ try:
         save()
     begin, end = '# >>> sites-dashboard >>>', '# <<< sites-dashboard <<<'
     for filename in metadata.get('profiles', []):
+        if metadata.get('uninstalled'):
+            break
         profile = Path(filename)
         if profile.is_symlink() or not profile.exists():
             continue
@@ -141,21 +159,31 @@ try:
     if venv.is_symlink() or app.is_symlink() or app.name != 'sites-dashboard':
         raise RuntimeError('Refusing an unexpected application directory: ' + str(app))
     for target in data_targets:
-        if target.exists():
+        if not metadata.get('uninstalled') and target.exists():
             shutil.rmtree(target)
     filenames = dict(metadata.get('owned_files', {}))
     for filename, record in metadata.get('pending_files', {}).items():
         filenames.setdefault(filename, record['new'])
     installed_uninstaller = str(app / 'uninstall.sh')
-    for filename, expected in filenames.items():
-        if filename != installed_uninstaller:
-            remove_owned(filename, expected)
-    if venv.exists():
-        shutil.rmtree(venv)
-    if installed_uninstaller in filenames:
-        remove_owned(installed_uninstaller, filenames[installed_uninstaller])
-    metadata['uninstalled'] = True
+    if not metadata.get('uninstalled'):
+        # Publish the logical completion/checkpoint while the installed retry
+        # script, modules and interpreter are all still intact.
+        metadata.update(uninstalled=True, cleanup_pending=True)
+        save()
+    if metadata.get('cleanup_pending'):
+        for filename, expected in filenames.items():
+            if filename != installed_uninstaller:
+                remove_owned(filename, expected)
+        if venv.exists():
+            shutil.rmtree(venv)
+    # Settle a pending replacement of the retry script without deleting it.
+    # Its final unlink must have no metadata writes left that can fail.
+    owned_retry = installed_uninstaller in filenames and remove_owned(
+        installed_uninstaller, filenames[installed_uninstaller], keep=True)
+    metadata['cleanup_pending'] = False
     save()
+    if owned_retry:
+        remove_owned(installed_uninstaller, metadata['owned_files'][installed_uninstaller])
     print('Uninstalled. Sites, backups, certificates and databases preserved.' if not args else
           'Uninstalled. Configured sites/backups deleted; certificates/databases require manual removal.')
     if retained:

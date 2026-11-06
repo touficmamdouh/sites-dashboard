@@ -259,7 +259,12 @@ try:
     write_owned(app / 'uninstall.sh', (source / 'uninstall.sh').read_bytes(), 0o755)
 
     if platform_name == 'macos':
-        mailpit_env = Path(os.environ.get('HOMEBREW_USER_CONFIG_HOME', str(Path.home() / '.homebrew'))) / 'services/mailpit.env'
+        # Ask Homebrew after it loads its environment files and derives the XDG
+        # precedence, rather than trusting an inherited internal variable.
+        brew_config = command([runtime.brew_binary, 'ruby', '-e', 'puts ENV.fetch("HOMEBREW_USER_CONFIG_HOME")'])
+        if not Path(brew_config).is_absolute() or any(ord(c) < 32 for c in brew_config):
+            raise RuntimeError('Homebrew returned an invalid user configuration directory.')
+        mailpit_env = Path(brew_config) / 'services/mailpit.env'
         mailpit_settings = 'MP_SMTP_BIND_ADDR=127.0.0.1:1025\nMP_UI_BIND_ADDR=127.0.0.1:8025\n'
         if mailpit_env.exists() and str(mailpit_env) not in files:
             existing = dict(line.split('=', 1) for line in mailpit_env.read_text().splitlines()
