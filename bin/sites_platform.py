@@ -7,12 +7,23 @@ import grp
 import json
 import os
 import platform
+import plistlib
 import re
 import shutil
+import stat
 import subprocess
+import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
+from string import Template
+from typing import TYPE_CHECKING
+from uuid import uuid4
+from xml.parsers.expat import ExpatError
+from xml.sax.saxutils import escape
+
+if TYPE_CHECKING:
+    from sites_config import RuntimeConfig
 
 
 @dataclass(frozen=True)
@@ -51,6 +62,183 @@ class RuntimePaths:
     brew_binary: Path | None = None
     nginx_launchd_label: str | None = None
     nginx_launchd_plist: Path | None = None
+
+
+NGINX_LAUNCHD_LABEL = "com.sites-dashboard.nginx"
+NGINX_PLIST_TEMPLATE = Path(__file__).resolve().parents[1] / "packaging/macos/com.sites-dashboard.nginx.plist.in"
+
+
+def _nginx_service_paths(runtime: RuntimePaths) -> tuple[Path, Path]:
+    if (runtime.platform != "macos" or runtime.service_backend != "launchd"
+            or runtime.nginx_launchd_label != NGINX_LAUNCHD_LABEL
+            or runtime.nginx_launchd_plist is None or not runtime.nginx_launchd_plist.is_absolute()
+            or runtime.nginx_launchd_plist.name != f"{NGINX_LAUNCHD_LABEL}.plist"
+            or runtime.brew_prefix is None or not runtime.brew_prefix.is_absolute()):
+        raise ValueError("Nginx bootstrap requires the generated macOS launchd label, plist, and Homebrew prefix.")
+    return runtime.brew_prefix / "bin/nginx", runtime.nginx_launchd_plist
+
+
+def render_nginx_launchd_plist(runtime: RuntimePaths, config_path: Path, log_dir: Path) -> str:
+    nginx, _ = _nginx_service_paths(runtime)
+    for account in (runtime.runtime_user, runtime.runtime_group):
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*", account) or account == "root":
+            raise ValueError("Nginx workers require a non-root macOS user and group.")
+    if any(not path.is_absolute() or any(ord(char) < 32 for char in str(path))
+           for path in (nginx, config_path, log_dir)):
+        raise ValueError("Nginx config and log paths must be absolute and contain no control characters.")
+    return Template(NGINX_PLIST_TEMPLATE.read_text()).substitute({
+        key: escape(str(value)) for key, value in {
+            "owner": runtime.runtime_user, "group": runtime.runtime_group,
+            "nginx": nginx, "config": config_path,
+            "stdout": log_dir / "nginx.stdout.log", "stderr": log_dir / "nginx.stderr.log",
+        }.items()
+    })
+
+
+def _owned_nginx_plist(runtime: RuntimePaths) -> bytes | None:
+    _, destination = _nginx_service_paths(runtime)
+    try:
+        info = destination.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError(f"Refusing non-owned Nginx plist: {destination} is not a regular file.")
+    content = destination.read_bytes()
+    try:
+        plist = plistlib.loads(content)
+        arguments = plist["ProgramArguments"]
+        old_config = Path(arguments[2])
+        old_logs = Path(plist["StandardErrorPath"]).parent
+        expected = plistlib.loads(render_nginx_launchd_plist(runtime, old_config, old_logs).encode())
+        if plist == expected:
+            return content
+    except (ValueError, TypeError, KeyError, IndexError, ExpatError, plistlib.InvalidFileException):
+        pass
+    raise ValueError(f"Refusing to replace non-owned Nginx plist: {destination}. Inspect it before retrying.")
+
+
+def _launchd_state(result: CommandResult) -> str:
+    if result.returncode:
+        return "inactive" if "Could not find service" in result.stderr else "unknown"
+    if re.search(r"(?m)^\s*state\s*=\s*running\s*$", result.stdout):
+        return "active"
+    exit_code = re.search(r"(?m)^\s*last exit code\s*=\s*(-?\d+)\s*$", result.stdout)
+    if exit_code and int(exit_code[1]):
+        return "failed"
+    return "inactive" if re.search(r"(?m)^\s*state\s*=\s*(?:waiting|exited|not running)\s*$", result.stdout) else "unknown"
+
+
+def _nginx_port_check(runtime: RuntimePaths, job: CommandResult, runner: CommandRunner) -> CommandResult:
+    result = runner(["sudo", "-n", "lsof", "-nP", "+c", "0", "-iTCP:80", "-iTCP:443", "-sTCP:LISTEN", "-Fpcn"])
+    if result.returncode not in {0, 1}:
+        return CommandResult(stderr=f"Cannot inspect ports 80/443: {result.stderr}", returncode=1)
+    listeners = []
+    pid, name = "", ""
+    for line in result.stdout.splitlines():
+        if line.startswith("p"):
+            pid, name = line[1:], ""
+        elif line.startswith("c"):
+            name = line[1:]
+        elif line.startswith("n"):
+            listeners.append((name, pid, line.rsplit(":", 1)[-1]))
+    valid = bool(listeners) and all(name and re.fullmatch(r"[1-9][0-9]*", pid) and port in {"80", "443"}
+                                    for name, pid, port in listeners)
+    warning = result.stderr.strip()
+    if ((result.stdout.strip() and not valid) or (warning and not (
+            result.returncode == 1 and valid and all(
+                re.fullmatch(r"lsof: (?:WARNING: )?Internet address not located: TCP:(?:80|443)", line.strip())
+                for line in warning.splitlines() if line.strip())))):
+        return CommandResult(stderr=f"Cannot inspect ports 80/443: {warning or 'unrecognized listener information'}", returncode=1)
+    owned = set()
+    if any(name == "nginx" for name, _, _ in listeners) and _launchd_state(job) == "active":
+        pids = re.findall(r"(?m)^\s*pid\s*=\s*([1-9][0-9]*)\s*$", job.stdout)
+        if len(pids) == 1:
+            processes = runner(["ps", "-axo", "pid=,ppid=,comm="])
+            parents = {}
+            if not processes.returncode:
+                for line in processes.stdout.splitlines():
+                    fields = line.split(None, 2)
+                    if (len(fields) == 3 and fields[0].isdigit() and fields[1].isdigit()
+                            and Path(fields[2].split()[0]).name.rstrip(":") == "nginx"):
+                        parents[fields[0]] = fields[1]
+                if pids[0] in parents:
+                    owned.add(pids[0])
+                    while children := {pid for pid, parent in parents.items() if parent in owned} - owned:
+                        owned.update(children)
+    for name, pid, port in listeners:
+        if name != "nginx" or pid not in owned:
+            return CommandResult(stderr=f"Port {port} is unavailable: {name} (PID {pid}). Cannot verify managed Nginx ownership.", returncode=1)
+    return CommandResult(stderr=warning)
+
+
+def install_nginx_service(config: RuntimeConfig, config_path: Path, log_dir: Path,
+                          runner: CommandRunner | None = None) -> CommandResult:
+    """Install the owned Nginx LaunchDaemon; callers generate its nginx.conf first.
+
+    The config must omit main-context user/daemon directives, supplied through
+    -g here, and include the runtime's enabled sites. Run as the login user with
+    sudo available for the narrowly scoped system commands.
+    """
+    execute = run_command if runner is None else runner
+    runtime = config.runtime
+    try:
+        if os.geteuid() == 0:
+            raise ValueError("Run Nginx service installation as the logged-in user, with sudo access.")
+        nginx, destination = _nginx_service_paths(runtime)
+        rendered = render_nginx_launchd_plist(runtime, config_path, log_dir).encode()
+        previous = _owned_nginx_plist(runtime)
+        target = f"system/{runtime.nginx_launchd_label}"
+        job = execute(["launchctl", "print", target])
+        if _launchd_state(job) == "unknown":
+            return CommandResult(stderr=f"Cannot inspect Nginx launchd job: {job.stderr or job.stdout}", returncode=1)
+        loaded = job.returncode == 0
+        if loaded and (previous is None or not any(
+                line.strip() == f"path = {destination}" for line in job.stdout.splitlines())):
+            raise ValueError("Refusing non-owned loaded Nginx launchd job; its plist path does not match.")
+        ports = _nginx_port_check(runtime, job, execute)
+        if ports.returncode:
+            return ports
+        log_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
+        if log_dir.is_symlink() or log_dir.stat().st_uid != os.geteuid():
+            raise ValueError(f"Nginx log directory must be owned by the logged-in user: {log_dir}")
+        result = execute(["sudo", "-n", str(nginx), "-t", "-c", str(config_path),
+                          "-g", f"daemon off; user {runtime.runtime_user} {runtime.runtime_group};"])
+        if result.returncode:
+            return result
+        changed = previous != rendered
+        if changed:
+            staged = destination.with_name(f".{destination.name}.{uuid4().hex}.tmp")
+            with tempfile.TemporaryDirectory(prefix="sites-nginx-") as temporary:
+                source = Path(temporary) / "nginx.plist"
+                source.write_bytes(rendered)
+                try:
+                    result = execute(["sudo", "-n", "install", "-o", "root", "-g", "wheel", "-m", "0644", str(source), str(staged)])
+                    if result.returncode:
+                        return result
+                    if _owned_nginx_plist(runtime) != previous:
+                        raise ValueError("Nginx plist changed during installation; refusing to replace it.")
+                    if loaded:
+                        result = execute(["sudo", "-n", "launchctl", "bootout", target])
+                        if result.returncode:
+                            return result
+                        loaded = False
+                    # ln publishes new files without replacing a concurrent install.
+                    command = ["ln", str(staged), str(destination)] if previous is None else ["mv", "-f", str(staged), str(destination)]
+                    result = execute(["sudo", "-n", *command])
+                    if result.returncode:
+                        return result
+                finally:
+                    execute(["sudo", "-n", "rm", "-f", str(staged)])
+        result = execute(["sudo", "-n", "launchctl", "enable", target])
+        if result.returncode:
+            return result
+        if not loaded:
+            result = execute(["sudo", "-n", "launchctl", "bootstrap", "system", str(destination)])
+        elif _launchd_state(job) != "active":
+            result = execute(["sudo", "-n", "launchctl", "kickstart", "-k", target])
+        return result if result.returncode else replace(result, stderr="\n".join(filter(None, [ports.stderr, result.stderr])))
+    except (OSError, ValueError) as error:
+        return CommandResult(stderr=str(error), returncode=1)
 
 
 def expand_path(value: str, env: Mapping[str, str]) -> Path:
@@ -199,12 +387,9 @@ class _MacOSAdapter:
     def status(runtime: RuntimePaths, service: str, runner: CommandRunner) -> str:
         if service == "nginx":
             result = runner(["launchctl", "print", f"system/{runtime.nginx_launchd_label}"])
-            if result.returncode:
-                return "inactive" if "Could not find service" in result.stderr else "unknown"
-            if re.search(r"\bstate\s*=\s*running\b", result.stdout):
-                return "active"
-            exit_code = re.search(r"last exit code\s*=\s*(\d+)", result.stdout)
-            return "failed" if exit_code and int(exit_code[1]) else "inactive"
+            return _launchd_state(result)
+        if os.geteuid() == 0:
+            return "unknown"
         try:
             services = _brew_services(runtime.brew_binary, runner)
         except RuntimeError:
@@ -215,6 +400,10 @@ class _MacOSAdapter:
     @staticmethod
     def action(runtime: RuntimePaths, service: str, action: str, persistent: bool, runner: CommandRunner) -> CommandResult:
         if service == "nginx":
+            try:
+                _nginx_service_paths(runtime)
+            except ValueError as error:
+                return CommandResult(stderr=str(error), returncode=1)
             target = f"system/{runtime.nginx_launchd_label}"
             if action in {"start", "restart"} and persistent:
                 result = runner(["sudo", "-n", "launchctl", "enable", target])
@@ -227,6 +416,8 @@ class _MacOSAdapter:
                 "enable": ["enable", target],
             }
             return runner(["sudo", "-n", "launchctl", *commands[action]])
+        if os.geteuid() == 0:
+            return CommandResult(stderr="Run Homebrew services as the logged-in user, without sudo.", returncode=1)
         base = [str(runtime.brew_binary), "services"]
         if action == "restart" and not persistent:
             result = runner([*base, "stop", service])
