@@ -5,6 +5,67 @@
 
 يعتمد على: **Nginx + PHP-FPM + MariaDB + WordPress** (اختياري).
 
+## 🍎 التثبيت على macOS 13+
+
+يدعم المثبّت macOS 13 أو أحدث على Apple Silicon (`arm64`) وIntel (`x86_64`). شغّله كمستخدم تسجيل الدخول، وليس عبر `sudo`؛ سيستخدم Homebrew لخدمات PHP وMariaDB وMailpit، ويستخدم `launchd` فقط لتشغيل Nginx على المنافذ 80 و443.
+
+```bash
+git clone https://github.com/touficmamdouh/sites-dashboard.git
+cd sites-dashboard
+./install.sh
+source ~/.zprofile
+sites dashboard
+```
+
+إذا لم يكن Homebrew مثبتاً، سيطلب المثبّت موافقتك على المثبّت الرسمي. في التشغيل غير التفاعلي سيعرض أوامر التثبيت اليدوي ثم يتوقف بأمان؛ لا يثبت Homebrew دون موافقة صريحة.
+
+بعد التثبيت:
+
+```bash
+sites create example.test
+open http://example.test
+sites create wordpress.test --wp
+open http://wordpress.test
+```
+
+لشهادة HTTPS محلية:
+
+```bash
+sites ssl example.test
+open https://example.test
+```
+
+كل رسائل البريد المحلية تظهر في Mailpit على [http://127.0.0.1:8025](http://127.0.0.1:8025)، ولا تُرسل إلى الإنترنت.
+
+```bash
+sites services
+sites start
+sites stop
+sites restart nginx
+```
+
+لتحديد نسخة PHP أو مسار socket قبل إعادة التثبيت/الترقية:
+
+```bash
+export SITES_PHP_SERVICE=php@8.3
+export SITES_PHP_SOCK="$HOME/.local/share/sites-dashboard/run/php-fpm.sock"
+./install.sh
+```
+
+إعادة تشغيل `./install.sh` آمنة للترقية: لا تكرر أسطر shell ولا تستبدل إعدادات عدّلها المستخدم. لإزالة البرنامج استخدم:
+
+```bash
+~/.local/share/sites-dashboard/uninstall.sh
+```
+
+الإزالة الافتراضية تحذف ملفات التشغيل والخدمات التي أنشأتها الأداة فقط، وتحافظ على المواقع والنسخ الاحتياطية والشهادات وقواعد البيانات. استخدم `--delete-data` فقط إذا أردت حذف مجلدي المواقع والنسخ الاحتياطية بعد التأكد من مسارهما.
+
+إذا كان أحد المنافذ 80 أو 443 أو 3306 أو 1025 أو 8025 مستخدماً، سيتوقف المثبّت برسالة واضحة ولن يستولي على خدمة لا يملكها. افحص التعارض بـ:
+
+```bash
+lsof -nP -iTCP:80 -iTCP:443 -iTCP:3306 -iTCP:1025 -iTCP:8025 -sTCP:LISTEN
+```
+
 ---
 
 ## ⚡ التثبيت السريع (دقيقة واحدة)
@@ -154,6 +215,67 @@ Local web server manager: start/stop services, create sites, backup/restore,
 SSL, an interactive TUI dashboard, and full CLI commands.
 
 Stack: **Nginx + PHP-FPM + MariaDB + WordPress** (optional).
+
+## 🍎 macOS 13+ installation
+
+The installer supports macOS 13 or newer on Apple Silicon (`arm64`) and Intel (`x86_64`). Run it as the logged-in user, without `sudo`. It uses Homebrew user services for PHP, MariaDB, and Mailpit, and a narrowly scoped `launchd` service for Nginx on ports 80/443.
+
+```bash
+git clone https://github.com/touficmamdouh/sites-dashboard.git
+cd sites-dashboard
+./install.sh
+source ~/.zprofile
+sites dashboard
+```
+
+If Homebrew is missing, the installer asks for explicit consent before running the official installer. In non-interactive mode it prints the manual commands and exits without installing anything implicitly.
+
+First run:
+
+```bash
+sites create example.test
+open http://example.test
+sites create wordpress.test --wp
+open http://wordpress.test
+```
+
+Create a locally trusted HTTPS certificate with `mkcert`:
+
+```bash
+sites ssl example.test
+open https://example.test
+```
+
+Local mail is captured by Mailpit at [http://127.0.0.1:8025](http://127.0.0.1:8025) and is never sent to the public internet.
+
+```bash
+sites services
+sites start
+sites stop
+sites restart nginx
+```
+
+To select a PHP formula or socket explicitly before installing/upgrading:
+
+```bash
+export SITES_PHP_SERVICE=php@8.3
+export SITES_PHP_SOCK="$HOME/.local/share/sites-dashboard/run/php-fpm.sock"
+./install.sh
+```
+
+Re-running `./install.sh` is the supported upgrade path. It does not duplicate shell exports or overwrite edited configuration. Uninstall with:
+
+```bash
+~/.local/share/sites-dashboard/uninstall.sh
+```
+
+By default, uninstall removes only runtime/service files owned by Sites Dashboard and preserves sites, backups, certificates, and databases. Pass `--delete-data` only when you intentionally want to remove the configured sites and backup directories.
+
+If ports 80, 443, 3306, 1025, or 8025 are already in use, installation stops with an explicit conflict instead of taking over an unrelated service. Inspect listeners with:
+
+```bash
+lsof -nP -iTCP:80 -iTCP:443 -iTCP:3306 -iTCP:1025 -iTCP:8025 -sTCP:LISTEN
+```
 
 ---
 

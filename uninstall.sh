@@ -182,7 +182,7 @@ try:
         installed_uninstaller, filenames[installed_uninstaller], keep=True)
     metadata['cleanup_pending'] = False
     save()
-    if owned_retry:
+    if owned_retry and installed_uninstaller in metadata.get('owned_files', {}):
         remove_owned(installed_uninstaller, metadata['owned_files'][installed_uninstaller])
     print('Uninstalled. Sites, backups, certificates and databases preserved.' if not args else
           'Uninstalled. Configured sites/backups deleted; certificates/databases require manual removal.')

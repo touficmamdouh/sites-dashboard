@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      run_native_smoke:
+        description: "Install Homebrew formulae and inspect macOS services"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-13, macos-14]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Run tests
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+        run: python -m pytest -q
+      - name: Validate shell entry points
+        run: bash -n install.sh build.sh uninstall.sh
+      - name: Validate help entry points
+        run: |
+          python bin/sites --help
+          python bin/newsite --help
+
+  native-macos-smoke:
+    name: Opt-in macOS Homebrew smoke
+    if: github.event_name == 'workflow_dispatch' && inputs.run_native_smoke == true
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install formulae without starting services
+        run: brew install python nginx php mariadb mailpit mkcert
+      - name: Exercise runtime and service discovery
+        env:
+          PYTHONPATH: bin
+          SITES_PHP_SERVICE: php
+          SITES_PHP_SOCK: ${{ runner.temp }}/sites-dashboard-php.sock
+        run: |
+          python - <<'PY'
+          from sites_platform import ServiceManager, detect_runtime
+
+          runtime = detect_runtime()
+          assert runtime.platform == "macos"
+          assert runtime.brew_prefix is not None
+          assert ServiceManager(runtime).status("php") in {"active", "inactive", "failed", "unknown"}
+          print(runtime)
+          PY

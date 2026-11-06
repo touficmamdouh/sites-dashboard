@@ -800,3 +800,35 @@ def test_interrupted_upgrade_then_uninstall_then_reinstall_retires_journal(sandb
     assert not removed.get('pending_files')
     data = installed(sandbox)
     assert data['ready'] and not data['uninstalled']
+
+
+@pytest.mark.parametrize('script_state', ['missing', 'missing-pending', 'pending-only', 'unrecorded'])
+def test_incomplete_uninstall_without_recorded_retry_script_finishes_cleanly(sandbox, script_state):
+    app = sandbox.home / '.local/share/sites-dashboard'
+    app.mkdir(parents=True)
+    sandbox.state.mkdir(parents=True)
+    script = app / 'uninstall.sh'
+    content = b'#!/bin/sh\n# preserved incomplete-install fixture\n'
+    pending = {}
+    staging = app / '.sites-dashboard-incomplete'
+    if script_state in ('pending-only', 'unrecorded'):
+        script.write_bytes(content)
+    if script_state in ('missing-pending', 'pending-only'):
+        staging.write_bytes(content)
+        pending[str(script)] = {'old': None, 'new': hashlib.sha256(content).hexdigest(),
+                                'temporary': str(staging)}
+    statefile = sandbox.state / 'runtime.json'
+    statefile.write_text(json.dumps({'app': str(app), 'owned_files': {}, 'pending_files': pending,
+                                    'cleanup_runtime_done': True, 'uninstalled': False}))
+    for _ in range(2):
+        result = sandbox.run('uninstall.sh')
+        assert result.returncode == 0, result.stdout + result.stderr
+        state = json.loads(statefile.read_text())
+        assert state['uninstalled'] and not state['cleanup_pending']
+        assert not state['pending_files']
+    assert not staging.exists()
+    if script_state == 'unrecorded':
+        assert script.read_bytes() == content
+        assert str(script) not in state['owned_files']
+    else:
+        assert not script.exists()
