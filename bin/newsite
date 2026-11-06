@@ -1,126 +1,257 @@
-#!/bin/bash
-# newsite - Create a new Nginx site with optional WordPress install
-# Usage: newsite <domain> [--wp]
+#!/usr/bin/env python3
+"""Create a local Nginx site with optional WordPress installation."""
 
-set -e
+from __future__ import annotations
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
+import argparse
+import ipaddress
+import os
+import re
+import secrets
+import shutil
+import stat
+import sys
+import tarfile
+import tempfile
+from dataclasses import dataclass, field
+from pathlib import Path, PurePosixPath
+from uuid import uuid4
 
-if [ -z "$1" ]; then
-    echo -e "${RED}Usage: newsite <domain.test> [--wp]${NC}"
-    echo "  Example: newsite ah.test --wp"
-    exit 1
-fi
+from sites_config import RuntimeConfig, load_config
+from sites_platform import CommandRunner, ServiceManager, run_command
 
-DOMAIN="$1"
-INSTALL_WP=false
-[ "$2" = "--wp" ] && INSTALL_WP=true
+HOSTS_PATH = Path("/etc/hosts")
+WP_VERSION = "6.7"
+# The runner accepts argv only. Open the private SQL file as stdin before exec,
+# so batch mode stops on SQL errors without putting credentials in argv.
+MYSQL_STDIN = "import os,sys; fd=os.open(sys.argv[1],os.O_RDONLY); os.dup2(fd,0); os.close(fd); os.execvp(sys.argv[2],sys.argv[2:])"
 
-# Paths (configurable via env; defaults to current user)
-WWW_DIR="${SITES_WEBROOT:-$HOME/www}"
-SITES_AVAILABLE="${NGINX_AVAILABLE:-/etc/nginx/sites-available}"
-SITES_ENABLED="${NGINX_ENABLED:-/etc/nginx/sites-enabled}"
-PHP_SOCK="${SITES_PHP_SOCK:-/run/php/php8.3-fpm.sock}"
-DB_ROOT_USER="${SITES_DB_ROOT_USER:-root}"
-DB_ROOT_PASS="${SITES_DB_ROOT_PASS:-root}"
-SITE_USER="${SITES_WEB_USER:-$(whoami)}"
-SITE_DIR="$WWW_DIR/$DOMAIN"
-NGINX_CONF="$SITES_AVAILABLE/$DOMAIN.conf"
-DB_NAME="${DOMAIN%%.*}"
-DB_NAME="${DB_NAME//[^a-zA-Z0-9_]/_}"
-WP_VERSION="6.7"
 
-echo -e "${YELLOW}🚀 Creating site: $DOMAIN${NC}"
+@dataclass(frozen=True)
+class CreateResult:
+    success: bool
+    domain: str
+    site_dir: Path
+    error: str = ""
+    db_password: str = field(default="", repr=False)
 
-# 1. Create directory
-echo -e "${GREEN}[1/7]${NC} Creating directory $SITE_DIR..."
-mkdir -p "$SITE_DIR"
 
-# 2. Create Nginx config
-echo -e "${GREEN}[2/7]${NC} Creating Nginx config..."
-sudo -n tee "$NGINX_CONF" > /dev/null << NGINX
-server {
+class CreationError(RuntimeError):
+    pass
+
+
+def checked(runner: CommandRunner, command: list[str], action: str, *, private: bool = False):
+    result = runner(command)
+    if result.returncode:
+        # Database errors can echo SQL containing the generated password.
+        detail = " Check credentials and existing database/user names." if private else f" {result.stderr or result.stdout}"
+        raise CreationError(f"{action} failed (exit {result.returncode}).{detail}")
+    return result
+
+
+def privileged(runner: CommandRunner, command: list[str], action: str):
+    return checked(runner, ["sudo", "-n", *command], action)
+
+
+def validate_domain(domain: str) -> str:
+    domain = domain.lower()
+    if len(domain) > 253 or not all(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label) for label in domain.split(".")):
+        raise CreationError("Invalid domain: use DNS labels containing letters, digits, and hyphens, e.g. example.test.")
+    try:
+        ipaddress.ip_address(domain)
+    except ValueError:
+        return domain
+    raise CreationError("Invalid domain: use a hostname, not an IP address.")
+
+
+def hosts_addition(content: str, domain: str) -> str:
+    found = False
+    for line in content.splitlines():
+        fields = line.split("#", 1)[0].split()
+        if len(fields) < 2 or domain not in [name.lower().rstrip(".") for name in fields[1:]]:
+            continue
+        if fields[0] not in {"127.0.0.1", "::1"}:
+            raise CreationError(f"Hosts conflict for {domain}: {line}")
+        found = True
+    if found:
+        return content
+    separator = "\n" if content and not content.endswith("\n") else ""
+    return f"{content}{separator}127.0.0.1\t{domain}\n::1\t{domain}\n"
+
+
+def private_file(path: Path, content: str) -> None:
+    with open(path, "x", opener=lambda name, flags: os.open(name, flags, 0o600)) as stream:
+        stream.write(content)
+
+
+def atomic_install(content: str, destination: Path, runner: CommandRunner, *, mode: int = 0o644,
+                   previous: str | None = None) -> None:
+    staged = destination.with_name(f".{destination.name}.{uuid4().hex}.tmp")
+    with tempfile.TemporaryDirectory(prefix="newsite-") as temporary:
+        source = Path(temporary) / "config"
+        private_file(source, content)
+        try:
+            privileged(runner, ["install", "-m", f"{mode:04o}", str(source), str(staged)], "Installing temporary configuration")
+            if previous is None:
+                # Publish a complete file atomically without replacing any existing target.
+                privileged(runner, ["ln", str(staged), str(destination)], "Publishing configuration")
+            else:
+                if destination.read_text() != previous:
+                    raise CreationError(f"{destination} changed during site creation; inspect it before retrying.")
+                privileged(runner, ["mv", "-f", str(staged), str(destination)], "Updating hosts")
+        finally:
+            runner(["sudo", "-n", "rm", "-f", str(staged)])
+
+
+def update_hosts(domain: str, runner: CommandRunner) -> None:
+    path = HOSTS_PATH.resolve(strict=True)
+    content = path.read_text()
+    updated = hosts_addition(content, domain)
+    if updated != content:
+        atomic_install(updated, path, runner, mode=stat.S_IMODE(path.stat().st_mode), previous=content)
+
+
+def nginx_value(value: Path | str) -> str:
+    text = str(value)
+    if any(char in text for char in "\r\n\0"):
+        raise CreationError("Nginx paths must not contain newlines or NUL bytes.")
+    if re.fullmatch(r"[a-zA-Z0-9/._:@+-]+", text):
+        return text
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$") + '"'
+
+
+def render_nginx(domain: str, site_dir: Path, config: RuntimeConfig) -> str:
+    return f"""server {{
     listen 80;
     listen [::]:80;
-    server_name $DOMAIN;
-    root $SITE_DIR;
+    server_name {domain};
+    root {nginx_value(site_dir)};
     index index.php index.html index.htm;
-
     client_max_body_size 64M;
 
-    location / {
-        try_files \$uri \$uri/ /index.php?\$args;
-    }
-
-    location ~ \.php\$ {
-        try_files \$uri =404;
-        fastcgi_pass unix:${PHP_SOCK};
+    location / {{
+        try_files $uri $uri/ /index.php?$args;
+    }}
+    location ~ \\.php$ {{
+        try_files $uri =404;
+        fastcgi_pass {nginx_value('unix:' + str(config.runtime.php_socket))};
         fastcgi_index index.php;
-        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
         include fastcgi_params;
-    }
-
-    location ~ ^/(\.user.ini|\.htaccess|\.git|\.svn|\.project|LICENSE|README.md) {
+    }}
+    location ~ ^/(\\.user.ini|\\.htaccess|\\.git|\\.svn|\\.project|LICENSE|README.md) {{
         return 404;
-    }
-
-    location ~ \.well-known { allow all; }
-
-    location ~ .*\.(gif|jpg|jpeg|png|bmp|swf)\$ {
+    }}
+    location ~ \\.well-known {{ allow all; }}
+    location ~ .*\\.(gif|jpg|jpeg|png|bmp|swf)$ {{
         expires 30d; error_log off; access_log off;
-    }
-
-    location ~ .*\.(js|css)?\$ {
+    }}
+    location ~ .*\\.(js|css)?$ {{
         expires 12h; error_log off; access_log off;
-    }
-}
-NGINX
+    }}
+}}
+"""
 
-# 3. Enable site
-echo -e "${GREEN}[3/7]${NC} Enabling site..."
-sudo -n ln -sf "$NGINX_CONF" "$SITES_ENABLED/"
 
-# 4. Add to /etc/hosts
-echo -e "${GREEN}[4/7]${NC} Adding to /etc/hosts..."
-if ! grep -q "^127\.0\.0\.1\s\+$DOMAIN" /etc/hosts; then
-    sudo -n sed -i "/^127\.0\.0\.1\s\+localhost/a 127.0.0.1\t$DOMAIN" /etc/hosts
-    sudo -n sed -i "/^::1\s\+ip6-localhost/a ::1\t$DOMAIN" /etc/hosts
-fi
+def _lsof_listeners(runner: CommandRunner) -> list[tuple[str, str, str]]:
+    result = runner(["sudo", "-n", "lsof", "-nP", "-c", "0", "-iTCP:80", "-iTCP:443", "-sTCP:LISTEN", "-Fpcn"])
+    if result.returncode and not (result.returncode == 1 and not result.stdout and not result.stderr):
+        raise CreationError(f"Cannot inspect ports 80/443 using lsof: {result.stderr}. Install lsof or check sudo access.")
+    listeners = []
+    pid, name = "unknown", "unknown process"
+    for line in result.stdout.splitlines():
+        if line.startswith("p"):
+            pid, name = line[1:], "unknown process"
+        elif line.startswith("c"):
+            name = line[1:]
+        elif line.startswith("n"):
+            listeners.append((name, pid, line.rsplit(":", 1)[-1]))
+    return listeners
 
-# 5. Create database
-echo -e "${GREEN}[5/7]${NC} Creating MySQL database..."
-DB_PASS=$(openssl rand -base64 12)
-sudo -n mysql -u "${DB_ROOT_USER}" -p"${DB_ROOT_PASS}" -e "
-    CREATE DATABASE IF NOT EXISTS ${DB_NAME} /*!40100 DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci */;
-    DROP USER IF EXISTS '${DB_NAME}'@'localhost';
-    CREATE USER '${DB_NAME}'@'localhost' IDENTIFIED BY '${DB_PASS}';
-    GRANT ALL PRIVILEGES ON ${DB_NAME}.* TO '${DB_NAME}'@'localhost';
-    FLUSH PRIVILEGES;
-" 2>&1
 
-# 6. Install WordPress
-if [ "$INSTALL_WP" = true ]; then
-    echo -e "${GREEN}[6/7]${NC} Installing WordPress..."
-    
-    # Download WP
-    cd /tmp
-    curl -sL "https://wordpress.org/wordpress-$WP_VERSION.tar.gz" -o wordpress.tar.gz
-    tar xzf wordpress.tar.gz
-    cp -r wordpress/* "$SITE_DIR/"
-    rm -rf wordpress wordpress.tar.gz
-    
-    # Set permissions
-    sudo -n chown -R "${SITE_USER}":"${SITE_USER}" "$SITE_DIR"
-    
-    # Generate salts first
-    SALTS=$(curl -s https://api.wordpress.org/secret-key/1.1/salt/)
-    
-    # Create wp-config (salts BEFORE wp-settings.php)
-    cat > "$SITE_DIR/wp-config.php" << WP
-<?php
-define('DB_NAME', '${DB_NAME}');
-define('DB_USER', '${DB_NAME}');
-define('DB_PASSWORD', '${DB_PASS}');
+def check_ports(config: RuntimeConfig, runner: CommandRunner) -> None:
+    listeners = []
+    if config.runtime.platform == "linux":
+        result = runner(["sudo", "-n", "ss", "-ltnp", "( sport = :80 or sport = :443 )"])
+        if result.returncode != 127:
+            if result.returncode:
+                raise CreationError(f"Cannot inspect ports 80/443: {result.stderr}")
+            for line in result.stdout.splitlines():
+                fields = line.split()
+                if len(fields) < 5 or fields[0] != "LISTEN":
+                    continue
+                port = fields[3].rsplit(":", 1)[-1]
+                processes = re.findall(r'\("([^\"]+)",pid=(\d+)', line)
+                listeners.extend((name, pid, port) for name, pid in processes or [("unknown process", "unknown")])
+        else:
+            listeners = _lsof_listeners(runner)
+    else:
+        listeners = _lsof_listeners(runner)
+    nginx_active = any(name == "nginx" for name, _, _ in listeners) and ServiceManager(config.runtime, runner).status("nginx") == "active"
+    for name, pid, port in listeners:
+        if name != "nginx" or not nginx_active:
+            raise CreationError(f"Port {port} is unavailable: {name} (PID {pid}). Free ports 80/443 before creating the site.")
+
+
+def mysql_option(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+    if "\0" in escaped:
+        raise CreationError("Database credentials must not contain NUL bytes.")
+    return '"' + escaped + '"'
+
+
+def runtime_binary(config: RuntimeConfig, name: str) -> str:
+    if config.runtime.platform == "macos":
+        return str(config.runtime.brew_prefix / "bin" / name)
+    return name
+
+
+def create_database(name: str, password: str, config: RuntimeConfig, runner: CommandRunner) -> None:
+    with tempfile.TemporaryDirectory(prefix="newsite-") as temporary:
+        options, query = Path(temporary) / "mysql.cnf", Path(temporary) / "database.sql"
+        private_file(options, f"[client]\nuser={mysql_option(config.db_root_user)}\npassword={mysql_option(config.db_root_pass)}\n")
+        private_file(query, f"""CREATE DATABASE `{name}` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER '{name}'@'localhost' IDENTIFIED BY '{password}';
+GRANT ALL PRIVILEGES ON `{name}`.* TO '{name}'@'localhost';
+FLUSH PRIVILEGES;
+""")
+        checked(runner, ["sudo", "-n", sys.executable, "-c", MYSQL_STDIN, str(query), runtime_binary(config, "mysql"),
+                         f"--defaults-extra-file={options}", "--batch", "--skip-force"],
+                "Creating database", private=True)
+
+
+def install_wordpress(site_dir: Path, db_name: str, password: str, runner: CommandRunner) -> None:
+    with tempfile.TemporaryDirectory(prefix="newsite-") as temporary:
+        archive = Path(temporary) / "wordpress.tar.gz"
+        checked(runner, ["curl", "--fail", "--silent", "--show-error", "--location", "--max-time", "120",
+                         f"https://wordpress.org/wordpress-{WP_VERSION}.tar.gz", "-o", str(archive)], "Downloading WordPress")
+        with tarfile.open(archive, "r:gz") as bundle:
+            members = bundle.getmembers()
+            for member in members:
+                path = PurePosixPath(member.name)
+                if (path.is_absolute() or ".." in path.parts or not path.parts or path.parts[0] != "wordpress"
+                        or not (member.isdir() or member.isfile())):
+                    raise CreationError(f"Unsafe WordPress archive member: {member.name}")
+            for member in members:
+                parts = PurePosixPath(member.name).parts[1:]
+                if not parts:
+                    continue
+                destination = site_dir.joinpath(*parts)
+                if member.isdir():
+                    destination.mkdir(parents=True, exist_ok=True)
+                else:
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    with bundle.extractfile(member) as source, destination.open("xb") as target:
+                        shutil.copyfileobj(source, target)
+                    destination.chmod(0o644)
+        if not (site_dir / "wp-settings.php").is_file():
+            raise CreationError("WordPress archive is missing wp-settings.php.")
+    keys = ("AUTH_KEY", "SECURE_AUTH_KEY", "LOGGED_IN_KEY", "NONCE_KEY", "AUTH_SALT", "SECURE_AUTH_SALT", "LOGGED_IN_SALT", "NONCE_SALT")
+    salts = "\n".join(f"define('{key}', '{secrets.token_urlsafe(48)}');" for key in keys)
+    private_file(site_dir / "wp-config.php", f"""<?php
+define('DB_NAME', '{db_name}');
+define('DB_USER', '{db_name}');
+define('DB_PASSWORD', '{password}');
 define('DB_HOST', 'localhost');
 define('DB_CHARSET', 'utf8mb4');
 define('DB_COLLATE', '');
@@ -128,39 +259,91 @@ define('WP_DEBUG', false);
 define('WP_AUTO_UPDATE_CORE', false);
 define('FS_METHOD', 'direct');
 
-\$table_prefix = 'wp_';
+$table_prefix = 'wp_';
 
-${SALTS}
+{salts}
 
 if (!defined('ABSPATH')) define('ABSPATH', __DIR__ . '/');
 require_once ABSPATH . 'wp-settings.php';
-WP
-    
-    # Set WP files ownership
-    chown -R "${SITE_USER}":"${SITE_USER}" "$SITE_DIR"
-    find "$SITE_DIR" -type d -exec chmod 755 {} \;
-    find "$SITE_DIR" -type f -exec chmod 644 {} \;
-    
-    echo -e "${GREEN}[7/7]${NC} Finishing..."
-else
-    echo -e "${GREEN}[6/7]${NC} Skipping WordPress install."
-    sudo -n chown -R "${SITE_USER}":"${SITE_USER}" "$SITE_DIR"
-    echo -e "${GREEN}[7/7]${NC} Finishing..."
-fi
+""")
+    (site_dir / "wp-config.php").chmod(0o640)
+    for path in site_dir.rglob("*"):
+        if path.is_dir():
+            path.chmod(0o755)
 
-# Reload Nginx
-sudo -n nginx -t && sudo -n systemctl reload nginx
 
-# Done
-echo ""
-echo -e "${GREEN}✅ Site created: http://$DOMAIN${NC}"
-if [ "$INSTALL_WP" = true ]; then
-    echo ""
-    echo "📝 WordPress Credentials:"
-    echo "   Site:    http://$DOMAIN/wp-admin/install.php"
-    echo "   DB Name: $DB_NAME"
-    echo "   DB User: $DB_NAME"
-    echo "   DB Pass: $DB_PASS"
-fi
-echo ""
-echo -e "${YELLOW}💡 To add SSL later:${NC} sudo -n certbot --nginx -d $DOMAIN"
+def create_site(domain: str, wp: bool, config: RuntimeConfig, runner: CommandRunner) -> CreateResult:
+    site_dir = config.webroot
+    try:
+        domain = validate_domain(domain)
+        site_dir = config.webroot / domain
+        conf = config.runtime.nginx_available / f"{domain}.conf"
+        enabled = config.runtime.nginx_enabled / conf.name
+        db_name = re.sub(r"[^a-z0-9_]", "_", domain.split(".", 1)[0])
+        if len(db_name) > 32:
+            raise CreationError("The first domain label must be at most 32 characters for a MySQL user name.")
+        for path in (site_dir, conf, enabled):
+            if os.path.lexists(path):
+                raise CreationError(f"Site target already exists: {path}. Refusing to overwrite it.")
+        hosts_addition(HOSTS_PATH.read_text(), domain)
+        text = render_nginx(domain, site_dir, config)
+        check_ports(config, runner)
+        print(f"🚀 Creating site: {domain}")
+        print(f"[1/7] Creating directory {site_dir}...")
+        site_dir.parent.mkdir(parents=True, exist_ok=True)
+        site_dir.mkdir(mode=0o755)
+        site_dir.chmod(0o755)
+        print("[2/7] Creating Nginx config...")
+        privileged(runner, ["mkdir", "-p", str(conf.parent), str(enabled.parent)], "Creating Nginx directories")
+        atomic_install(text, conf, runner)
+        print("[3/7] Enabling site...")
+        privileged(runner, ["ln", "-s", str(conf), str(enabled)], "Enabling site")
+        print("[4/7] Adding to /etc/hosts...")
+        update_hosts(domain, runner)
+        print("[5/7] Creating MySQL database...")
+        password = secrets.token_urlsafe(24)
+        create_database(db_name, password, config, runner)
+        if wp:
+            print("[6/7] Installing WordPress...")
+            install_wordpress(site_dir, db_name, password, runner)
+        else:
+            print("[6/7] Skipping WordPress install.")
+        privileged(runner, ["chown", "-R", f"{config.web_user}:{config.web_group}", str(site_dir)], "Setting site ownership")
+        print("[7/7] Finishing...")
+        nginx = runtime_binary(config, "nginx")
+        privileged(runner, [nginx, "-t"], "Validating Nginx configuration")
+        check_ports(config, runner)
+        command = ["systemctl", "reload", "nginx"] if config.runtime.platform == "linux" else [nginx, "-s", "reload"]
+        privileged(runner, command, "Reloading Nginx")
+        check_ports(config, runner)
+        print(f"\n✅ Site created: http://{domain}")
+        if wp:
+            print(f"\n📝 WordPress Credentials:\n   Site:    http://{domain}/wp-admin/install.php\n"
+                  f"   DB Name: {db_name}\n   DB User: {db_name}\n   DB Pass: {password}")
+        print(f"\n💡 To add SSL later: sudo -n certbot --nginx -d {domain}")
+        return CreateResult(True, domain, site_dir, db_password=password)
+    except (CreationError, OSError, tarfile.TarError) as error:
+        message = str(error)
+        print(f"Error: {message}")
+        return CreateResult(False, domain, site_dir, error=message)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="newsite", usage="newsite <domain.test> [--wp]",
+                                     description="Create a new Nginx site. Example: newsite ah.test --wp")
+    parser.add_argument("domain", help="Site domain, e.g. example.test")
+    parser.add_argument("--wp", action="store_true", help="Install WordPress")
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as error:
+        return int(error.code)
+    try:
+        config = load_config()
+    except (RuntimeError, OSError) as error:
+        print(f"Error: {error}")
+        return 1
+    return 0 if create_site(args.domain, args.wp, config, run_command).success else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
