@@ -165,14 +165,18 @@ def test_all_service_actions_use_runtime(cli, config, commands, action, names):
                for call in commands.calls)
 
 
-def test_linux_start_uses_discovered_php(cli, config, commands):
+@pytest.mark.parametrize("action,target", [("start", None), ("restart", None), ("restart", "php8.6-fpm")])
+def test_linux_service_actions_preserve_boot_configuration(cli, config, commands, action, target):
     linux = replace(config, runtime=replace(config.runtime, platform="linux",
                                            php_service="php8.6-fpm", service_backend="systemd"))
-    cli.cli_start(linux, runner=commands.run)
-    assert commands.calls[:4] == [
-        ("sudo", "-n", "systemctl", "enable", "--now", service)
-        for service in ("mariadb", "mailpit", "php8.6-fpm", "nginx")
-    ]
+    if action == "start":
+        cli.cli_start(linux, runner=commands.run)
+    else:
+        cli.cli_restart(target, linux, runner=commands.run)
+    actions = [call for call in commands.calls if call[0] == "sudo"]
+    services = [target] if target else ["mariadb", "mailpit", "php8.6-fpm", "nginx"]
+    assert actions == [("sudo", "-n", "systemctl", action, service) for service in services]
+    assert all("enable" not in call and "--now" not in call for call in commands.calls)
 
 
 def test_service_failure_does_not_report_success(cli, config, capsys):
@@ -225,5 +229,39 @@ def test_dashboard_refresh_renders_runtime_service_and_socket(cli, config, comma
             assert str(config.runtime.php_socket) in text
             apps[0].refresh_all()
             assert str(config.runtime.php_socket) in str(widget.render())
+
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize("width", [50, 80])
+def test_dashboard_socket_is_visible_in_narrow_viewport(cli, config, commands, monkeypatch, width):
+    from textual.app import App
+    from textual.widgets import Static
+
+    config = replace(config, runtime=replace(
+        config.runtime,
+        php_socket=Path("/opt/homebrew/var/run/" + "long-discovered-pool-directory/" * 4 + "php-fpm.sock"),
+    ))
+    apps = []
+    monkeypatch.setattr(cli, "RUNTIME", config)
+    monkeypatch.setattr("sites_platform.run_command", commands.run)
+    monkeypatch.setattr(App, "run", lambda self: apps.append(self))
+    cli.run_dashboard()
+
+    async def check():
+        async with apps[0].run_test(size=(width, 24)) as pilot:
+            for _ in range(2):
+                await pilot.pause()
+                widget = apps[0].query_one("#svc-status", Static)
+                region = widget.content_region.intersection(apps[0].screen.region)
+                strips = apps[0].screen._compositor.render_strips()
+                visible = "".join(
+                    strips[y].crop(region.x, region.right).text
+                    for y in range(region.y, region.bottom)
+                )
+                visible = "".join(visible.split())
+                assert "php@8.4[active]" in visible
+                assert str(config.runtime.php_socket) in visible
+                apps[0].refresh_all()
 
     asyncio.run(check())

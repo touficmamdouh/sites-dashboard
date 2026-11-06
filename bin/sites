@@ -290,7 +290,10 @@ def service_action(action, target=None, runtime=None, runner=None) -> bool:
         services.reverse()
     success = True
     for service in services:
-        result = getattr(manager, action)(service)
+        if action in {"start", "restart"}:
+            result = getattr(manager, action)(service, persistent=runtime.runtime.platform == "macos")
+        else:
+            result = manager.stop(service)
         if result.returncode:
             Console().print(f"[red]Error {action} {service}:[/red] {result.stderr or result.stdout}")
             success = False
@@ -928,7 +931,7 @@ def run_dashboard():
         }
 
         .services-box {
-            height: 5;
+            height: auto;
             border: solid $primary;
             margin: 0 1;
             padding: 0 1;
