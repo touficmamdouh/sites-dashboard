@@ -155,9 +155,7 @@ def render_nginx(domain: str, site_dir: Path, config: RuntimeConfig) -> str:
 
 def _lsof_listeners(runner: CommandRunner) -> list[tuple[str, str, str]]:
     result = runner(["sudo", "-n", "lsof", "-nP", "+c", "0", "-iTCP:80", "-iTCP:443", "-sTCP:LISTEN", "-Fpcn"])
-    # lsof can return 1 for an unmatched port selection while listing the other.
-    # Diagnostics or other exit codes still mean inspection was not reliable.
-    if result.returncode not in {0, 1} or result.stderr:
+    if result.returncode not in {0, 1}:
         raise CreationError(f"Cannot inspect ports 80/443 using lsof: {result.stderr}. Install lsof or check sudo access.")
     listeners = []
     pid, name = "unknown", "unknown process"
@@ -168,7 +166,20 @@ def _lsof_listeners(runner: CommandRunner) -> list[tuple[str, str, str]]:
             name = line[1:]
         elif line.startswith("n"):
             listeners.append((name, pid, line.rsplit(":", 1)[-1]))
-    if result.stdout.strip() and not listeners:
+    valid = bool(listeners) and all(
+        re.fullmatch(r"[1-9][0-9]*", pid) and name not in {"", "unknown process"} and port in {"80", "443"}
+        for name, pid, port in listeners
+    )
+    diagnostic = result.stderr.strip()
+    if diagnostic:
+        # Only an unmatched requested address may accompany reliable results.
+        # Match every complete line so mixed warnings/errors cannot be hidden.
+        unmatched = all(re.fullmatch(r"lsof: (?:WARNING: )?Internet address not located: TCP:(?:80|443)", line.strip())
+                        for line in diagnostic.splitlines() if line.strip())
+        if result.returncode != 1 or not valid or not unmatched:
+            raise CreationError(f"Cannot inspect ports 80/443 using lsof: {diagnostic}. Install lsof or check sudo access.")
+        print(f"Warning: {diagnostic}", file=sys.stderr)
+    if result.stdout.strip() and not valid:
         raise CreationError("Cannot inspect ports 80/443: lsof returned unrecognized listener information.")
     return listeners
 

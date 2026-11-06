@@ -254,6 +254,44 @@ def test_lsof_unmatched_port_selection_keeps_valid_listeners(newsite, output, wa
     assert newsite._lsof_listeners(lambda cmd: CommandResult(output, "", 1)) == want
 
 
+@pytest.mark.parametrize("diagnostic", ["lsof: Internet address not located: TCP:443\n",
+                                         "lsof: WARNING: Internet address not located: TCP:443\n"])
+def test_lsof_exit_one_with_listener_and_unmatched_warning(newsite, capsys, diagnostic):
+    response = CommandResult("p123\ncnginx\nn*:80\n", diagnostic, 1)
+    assert newsite._lsof_listeners(lambda cmd: response) == [("nginx", "123", "80")]
+    assert diagnostic.strip() in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("diagnostic", ["lsof: permission denied",
+                                         "lsof: WARNING: can't stat() file system; output may be incomplete",
+                                         "lsof: WARNING: unknown inspection problem",
+                                         "lsof: Internet address not located: TCP:443\nlsof: permission denied",
+                                         "lsof: Internet address not located: TCP:443; permission denied"])
+def test_lsof_exit_one_with_listener_keeps_real_diagnostic_errors_fatal(newsite, diagnostic, capsys):
+    with pytest.raises(newsite.CreationError, match="Cannot inspect ports"):
+        newsite._lsof_listeners(lambda cmd: CommandResult("p123\ncnginx\nn*:80\n", diagnostic, 1))
+    assert not capsys.readouterr().err
+
+
+@pytest.mark.parametrize("output,code", [("", 1), ("p123\ncnginx\n", 1),
+                                         ("n*:80\n", 1), ("p123\ncnginx\nn*:80\n", 2)])
+def test_lsof_warning_requires_valid_listeners_and_selection_exit(newsite, output, code):
+    with pytest.raises(newsite.CreationError, match="Cannot inspect ports"):
+        newsite._lsof_listeners(lambda cmd: CommandResult(output, "lsof: Internet address not located: TCP:443", code))
+
+
+def test_managed_nginx_with_unmatched_lsof_warning_allows_site_creation(newsite, config, runner, capsys):
+    def inspect(command):
+        if "ss" in command:
+            return CommandResult(returncode=127)
+        if "lsof" in command:
+            return CommandResult("p123\ncnginx\nn*:80\n", "lsof: Internet address not located: TCP:443", 1)
+        return runner(command)
+
+    assert newsite.create_site("example.test", False, config, inspect).success
+    assert "Internet address not located" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize("response", [CommandResult(stderr="sudo: permission denied", returncode=1),
                                       CommandResult("p123\ncnginx\nn*:80\n", "lsof: inspection failed", 1),
                                       CommandResult(returncode=2), CommandResult("unparseable output", "", 1)])
