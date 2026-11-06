@@ -282,6 +282,82 @@ def test_nginx_actions_refuse_a_different_system_label(runtime, fake_runner):
     assert runner.calls == []
 
 
+NGINX_ACTIONS = [("start", True), ("start", False), ("restart", True),
+                 ("restart", False), ("stop", None), ("enable", None)]
+
+
+def nginx_action(runtime, runner, action, persistent):
+    kwargs = {} if persistent is None else {"persistent": persistent}
+    return getattr(ServiceManager(runtime, runner), action)("nginx", **kwargs)
+
+
+@pytest.mark.parametrize("action,persistent", NGINX_ACTIONS)
+@pytest.mark.parametrize("kind", ["foreign", "other_user", "symlink", "missing"])
+def test_direct_nginx_actions_refuse_unowned_plist(runtime, paths, runner, tmp_path, action, persistent, kind):
+    path = runtime.nginx_launchd_plist
+    original = sites_platform.render_nginx_launchd_plist(runtime, *paths)
+    if kind == "foreign":
+        path.write_bytes(plistlib.dumps({"Label": LABEL, "ProgramArguments": ["/tmp/foreign-nginx"]}))
+    elif kind == "other_user":
+        path.write_text(sites_platform.render_nginx_launchd_plist(replace(runtime, runtime_user="bob"), *paths))
+    elif kind == "symlink":
+        target = tmp_path / "symlink-target.plist"
+        target.write_text(original)
+        path.symlink_to(target)
+    before = path.read_bytes() if path.exists() else None
+    runner.loaded = action != "start"
+    result = nginx_action(runtime, runner, action, persistent)
+    assert result.returncode != 0 and "plist" in result.stderr.lower()
+    assert runner.calls == []
+    assert (path.read_bytes() if path.exists() else None) == before
+    if kind == "symlink":
+        assert path.is_symlink()
+
+
+@pytest.mark.parametrize("action,persistent", NGINX_ACTIONS)
+@pytest.mark.parametrize("job", [CommandResult("state = running\npath = /tmp/foreign.plist\npid = 123\n"),
+                                 CommandResult("state = running\npid = 123\n"),
+                                 CommandResult("", "Permission denied", 1)])
+def test_direct_nginx_actions_refuse_unverified_loaded_job(runtime, paths, fake_runner, action, persistent, job):
+    runtime.nginx_launchd_plist.write_text(sites_platform.render_nginx_launchd_plist(runtime, *paths))
+    probe = ("launchctl", "print", TARGET)
+    runner = fake_runner({probe: job})
+    result = nginx_action(runtime, runner, action, persistent)
+    assert result.returncode != 0
+    assert runner.calls == [probe]
+
+
+@pytest.mark.parametrize("action,persistent", NGINX_ACTIONS)
+def test_direct_nginx_actions_allow_owned_plist_and_job(runtime, paths, runner, action, persistent):
+    runtime.nginx_launchd_plist.write_text(sites_platform.render_nginx_launchd_plist(runtime, *paths))
+    runner.loaded = action != "start"
+    assert nginx_action(runtime, runner, action, persistent).returncode == 0
+    expected = [("launchctl", "print", TARGET)]
+    if persistent or action == "enable":
+        expected.append(("sudo", "-n", "launchctl", "enable", TARGET))
+    if action == "start":
+        expected.append(("sudo", "-n", "launchctl", "bootstrap", "system", str(runtime.nginx_launchd_plist)))
+    elif action == "restart":
+        expected.append(("sudo", "-n", "launchctl", "kickstart", "-k", TARGET))
+    elif action == "stop":
+        expected.append(("sudo", "-n", "launchctl", "bootout", TARGET))
+    assert runner.calls == expected
+
+
+@pytest.mark.parametrize("content", [
+    pytest.param(b'<?xml version="1.0"?><plist><date>not-a-date</date></plist>', id="invalid-date"),
+    pytest.param(b'<?xml version="1.0" encoding="BOGUS"?><plist><dict/></plist>', id="unknown-encoding"),
+])
+@pytest.mark.parametrize("action,persistent", [("install", None), *NGINX_ACTIONS])
+def test_malformed_plist_returns_controlled_refusal(runtime, paths, runner, content, action, persistent):
+    runtime.nginx_launchd_plist.write_bytes(content)
+    result = install(runtime, paths, runner) if action == "install" else nginx_action(runtime, runner, action, persistent)
+    assert isinstance(result, CommandResult)
+    assert result.returncode != 0 and "non-owned" in result.stderr
+    assert runtime.nginx_launchd_plist.read_bytes() == content
+    assert runner.calls == []
+
+
 @pytest.mark.parametrize("output,state", [("unrecognized output", "unknown"),
                                          ("state = waiting\nlast exit code = -9", "failed")])
 def test_launchd_status_does_not_hide_failure_or_bad_output(runtime, fake_runner, output, state):

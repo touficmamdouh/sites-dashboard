@@ -1,9 +1,10 @@
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
-from sites_platform import CommandResult, ServiceManager, detect_runtime, run_command
+from sites_platform import CommandResult, ServiceManager, detect_runtime, render_nginx_launchd_plist, run_command
 
 
 def mac_runner(fake_runner, prefix="/opt/homebrew", service="php@8.3", status="started", listen=None):
@@ -147,6 +148,15 @@ def mac_runtime(host, fake_runner):
 
 
 @pytest.fixture
+def owned_mac_runtime(mac_runtime, tmp_path):
+    runtime = replace(mac_runtime, nginx_launchd_plist=tmp_path / "com.sites-dashboard.nginx.plist")
+    runtime.nginx_launchd_plist.write_text(render_nginx_launchd_plist(
+        runtime, tmp_path / "nginx.conf", tmp_path / "logs",
+    ))
+    return runtime
+
+
+@pytest.fixture
 def linux_runtime(host, fake_runner):
     host("Linux")
     runner = fake_runner({("/usr/sbin/php-fpm8.3", "-tt"): CommandResult("", "unavailable", 127)})
@@ -193,11 +203,18 @@ def test_brew_service_actions_are_user_scoped(mac_runtime, fake_runner, service,
     ("stop", [("bootout", "system/com.sites-dashboard.nginx")]),
     ("enable", [("enable", "system/com.sites-dashboard.nginx")]),
 ])
-def test_nginx_uses_generated_system_launchd_label(mac_runtime, fake_runner, method, actions):
+def test_nginx_uses_generated_system_launchd_label(owned_mac_runtime, fake_runner, method, actions):
+    mac_runtime = owned_mac_runtime
+    actions = [tuple(str(mac_runtime.nginx_launchd_plist) if arg == "/Library/LaunchDaemons/com.sites-dashboard.nginx.plist" else arg
+                     for arg in command) for command in actions]
     expected = [("sudo", "-n", "launchctl", *action) for action in actions]
-    runner = fake_runner(dict.fromkeys(expected, ""))
+    probe = ("launchctl", "print", "system/com.sites-dashboard.nginx")
+    job = CommandResult("", "Could not find service", 113) if method == "start" else CommandResult(
+        f"path = {mac_runtime.nginx_launchd_plist}\nstate = running\n",
+    )
+    runner = fake_runner({**dict.fromkeys(expected, ""), probe: job})
     assert getattr(ServiceManager(mac_runtime, runner), method)("nginx").returncode == 0
-    assert runner.calls == expected
+    assert runner.calls == [probe, *expected]
 
 
 @pytest.mark.parametrize("raw,expected", [("started", "active"), ("stopped", "inactive"), ("error", "failed"), ("other", "unknown")])
@@ -298,11 +315,18 @@ def test_transient_brew_restart_preserves_stop_failure(mac_runtime, fake_runner)
 
 @pytest.mark.parametrize("method,action", [("start", ("bootstrap", "system", "/Library/LaunchDaemons/com.sites-dashboard.nginx.plist")),
                                           ("restart", ("kickstart", "-k", "system/com.sites-dashboard.nginx"))])
-def test_transient_nginx_action_does_not_enable(mac_runtime, fake_runner, method, action):
+def test_transient_nginx_action_does_not_enable(owned_mac_runtime, fake_runner, method, action):
+    mac_runtime = owned_mac_runtime
+    action = tuple(str(mac_runtime.nginx_launchd_plist) if arg == "/Library/LaunchDaemons/com.sites-dashboard.nginx.plist" else arg
+                   for arg in action)
     command = ("sudo", "-n", "launchctl", *action)
-    runner = fake_runner({command: ""})
+    probe = ("launchctl", "print", "system/com.sites-dashboard.nginx")
+    job = CommandResult("", "Could not find service", 113) if method == "start" else CommandResult(
+        f"path = {mac_runtime.nginx_launchd_plist}\nstate = running\n",
+    )
+    runner = fake_runner({command: "", probe: job})
     assert getattr(ServiceManager(mac_runtime, runner), method)("nginx", persistent=False).returncode == 0
-    assert runner.calls == [command]
+    assert runner.calls == [probe, command]
 
 
 def test_default_runner_preserves_output_and_exit_code(monkeypatch):

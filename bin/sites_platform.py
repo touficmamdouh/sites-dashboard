@@ -19,7 +19,6 @@ from pathlib import Path
 from string import Template
 from typing import TYPE_CHECKING
 from uuid import uuid4
-from xml.parsers.expat import ExpatError
 from xml.sax.saxutils import escape
 
 if TYPE_CHECKING:
@@ -106,13 +105,17 @@ def _owned_nginx_plist(runtime: RuntimePaths) -> bytes | None:
     content = destination.read_bytes()
     try:
         plist = plistlib.loads(content)
+    except Exception as error:
+        # plistlib's XML/binary decoders have no common malformed-input exception.
+        raise ValueError(f"Refusing non-owned Nginx plist: {destination} is malformed.") from error
+    try:
         arguments = plist["ProgramArguments"]
         old_config = Path(arguments[2])
         old_logs = Path(plist["StandardErrorPath"]).parent
         expected = plistlib.loads(render_nginx_launchd_plist(runtime, old_config, old_logs).encode())
         if plist == expected:
             return content
-    except (ValueError, TypeError, KeyError, IndexError, ExpatError, plistlib.InvalidFileException):
+    except (ValueError, TypeError, KeyError, IndexError):
         pass
     raise ValueError(f"Refusing to replace non-owned Nginx plist: {destination}. Inspect it before retrying.")
 
@@ -126,6 +129,44 @@ def _launchd_state(result: CommandResult) -> str:
     if exit_code and int(exit_code[1]):
         return "failed"
     return "inactive" if re.search(r"(?m)^\s*state\s*=\s*(?:waiting|exited|not running)\s*$", result.stdout) else "unknown"
+
+
+def _nginx_job_loaded(runtime: RuntimePaths, job: CommandResult, owned: bytes | None) -> bool:
+    if _launchd_state(job) == "unknown":
+        raise ValueError(f"Cannot inspect Nginx launchd job: {job.stderr or job.stdout}")
+    loaded = job.returncode == 0
+    if loaded and (owned is None or not any(
+            line.strip() == f"path = {runtime.nginx_launchd_plist}" for line in job.stdout.splitlines())):
+        raise ValueError("Refusing non-owned loaded Nginx launchd job; its plist path does not match.")
+    return loaded
+
+
+def _nginx_launchd_action(runtime: RuntimePaths, action: str, persistent: bool, runner: CommandRunner) -> CommandResult:
+    try:
+        _nginx_service_paths(runtime)
+        owned = _owned_nginx_plist(runtime)
+        if owned is None:
+            raise ValueError(f"Missing owned Nginx plist: {runtime.nginx_launchd_plist}. Install the service first.")
+        target = f"system/{runtime.nginx_launchd_label}"
+        _nginx_job_loaded(runtime, runner(["launchctl", "print", target]), owned)
+        commands = {
+            "start": ["bootstrap", "system", str(runtime.nginx_launchd_plist)],
+            "restart": ["kickstart", "-k", target],
+            "stop": ["bootout", target],
+            "enable": ["enable", target],
+        }
+        actions = [commands[action]]
+        if action in {"start", "restart"} and persistent:
+            actions.insert(0, ["enable", target])
+        for command in actions:
+            if _owned_nginx_plist(runtime) != owned:
+                raise ValueError("Nginx plist changed before service action; refusing mutation.")
+            result = runner(["sudo", "-n", "launchctl", *command])
+            if result.returncode:
+                return result
+        return result
+    except (OSError, ValueError) as error:
+        return CommandResult(stderr=str(error), returncode=1)
 
 
 def _nginx_port_check(runtime: RuntimePaths, job: CommandResult, runner: CommandRunner) -> CommandResult:
@@ -189,12 +230,7 @@ def install_nginx_service(config: RuntimeConfig, config_path: Path, log_dir: Pat
         previous = _owned_nginx_plist(runtime)
         target = f"system/{runtime.nginx_launchd_label}"
         job = execute(["launchctl", "print", target])
-        if _launchd_state(job) == "unknown":
-            return CommandResult(stderr=f"Cannot inspect Nginx launchd job: {job.stderr or job.stdout}", returncode=1)
-        loaded = job.returncode == 0
-        if loaded and (previous is None or not any(
-                line.strip() == f"path = {destination}" for line in job.stdout.splitlines())):
-            raise ValueError("Refusing non-owned loaded Nginx launchd job; its plist path does not match.")
+        loaded = _nginx_job_loaded(runtime, job, previous)
         ports = _nginx_port_check(runtime, job, execute)
         if ports.returncode:
             return ports
@@ -400,22 +436,7 @@ class _MacOSAdapter:
     @staticmethod
     def action(runtime: RuntimePaths, service: str, action: str, persistent: bool, runner: CommandRunner) -> CommandResult:
         if service == "nginx":
-            try:
-                _nginx_service_paths(runtime)
-            except ValueError as error:
-                return CommandResult(stderr=str(error), returncode=1)
-            target = f"system/{runtime.nginx_launchd_label}"
-            if action in {"start", "restart"} and persistent:
-                result = runner(["sudo", "-n", "launchctl", "enable", target])
-                if result.returncode:
-                    return result
-            commands = {
-                "start": ["bootstrap", "system", str(runtime.nginx_launchd_plist)],
-                "restart": ["kickstart", "-k", target],
-                "stop": ["bootout", target],
-                "enable": ["enable", target],
-            }
-            return runner(["sudo", "-n", "launchctl", *commands[action]])
+            return _nginx_launchd_action(runtime, action, persistent, runner)
         if os.geteuid() == 0:
             return CommandResult(stderr="Run Homebrew services as the logged-in user, without sudo.", returncode=1)
         base = [str(runtime.brew_binary), "services"]

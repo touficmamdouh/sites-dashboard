@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from sites_config import load_config
-from sites_platform import CommandResult, RuntimePaths
+from sites_platform import CommandResult, RuntimePaths, render_nginx_launchd_plist
 
 
 @pytest.fixture
@@ -33,13 +33,16 @@ def config(tmp_path):
         php_binary=prefix / "opt/php@8.4/sbin/php-fpm",
         runtime_user="alice", runtime_group="staff", brew_binary=prefix / "bin/brew",
         nginx_launchd_label="com.sites-dashboard.nginx",
-        nginx_launchd_plist=Path("/Library/LaunchDaemons/com.sites-dashboard.nginx.plist"),
+        nginx_launchd_plist=tmp_path / "com.sites-dashboard.nginx.plist",
     )
+    paths.nginx_launchd_plist.write_text(render_nginx_launchd_plist(
+        paths, prefix / "etc/nginx/nginx.conf", tmp_path / ".config/sites-dashboard/logs",
+    ))
     return load_config({"HOME": str(tmp_path), "USER": "alice"}, paths)
 
 
 @pytest.fixture
-def commands(monkeypatch):
+def commands(monkeypatch, config):
     calls = []
 
     def execute(command, **kwargs):
@@ -49,7 +52,7 @@ def commands(monkeypatch):
                                  '{"name":"mailpit","status":"started"},'
                                  '{"name":"mariadb","status":"started"}]')
         if command[0] == "launchctl":
-            return CommandResult("state = running")
+            return CommandResult(f"path = {config.runtime.nginx_launchd_plist}\nstate = running\n")
         if command[:2] == ["systemctl", "is-active"]:
             return CommandResult("active")
         return CommandResult()
@@ -87,13 +90,14 @@ def test_get_service_status_uses_discovered_php_service(cli, config, commands):
 def test_start_uses_service_manager_for_all_runtime_services(cli, config, commands):
     cli.cli_start(config, runner=commands.run)
     brew = str(config.runtime.brew_binary)
-    assert commands.calls[:5] == [
+    assert commands.calls[:6] == [
         (brew, "services", "start", "mariadb"),
         (brew, "services", "start", "mailpit"),
         (brew, "services", "start", "php@8.4"),
+        ("launchctl", "print", "system/com.sites-dashboard.nginx"),
         ("sudo", "-n", "launchctl", "enable", "system/com.sites-dashboard.nginx"),
         ("sudo", "-n", "launchctl", "bootstrap", "system",
-         "/Library/LaunchDaemons/com.sites-dashboard.nginx.plist"),
+         str(config.runtime.nginx_launchd_plist)),
     ]
     assert all("systemctl" not in call for call in commands.calls)
 
