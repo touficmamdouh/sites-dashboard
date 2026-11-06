@@ -61,6 +61,8 @@ class HostRunner:
         self.listeners = ""
         self.db_files = []
         self.mysql_arguments = []
+        self.main_pid = "123"
+        self.processes = "123 1 /usr/sbin/nginx\n124 123 nginx\n999 1 nginx\n1000 999 nginx\n"
 
     def path(self, value):
         path = Path(value)
@@ -122,10 +124,15 @@ class HostRunner:
         elif tool == "systemctl":
             if args[1] == "is-active":
                 return CommandResult("active")
+            if args[1:] == ["show", "nginx", "--property=MainPID", "--value"]:
+                return CommandResult(self.main_pid)
             assert args[1:] == ["reload", "nginx"]
         elif tool == "launchctl":
             assert args[1:] == ["print", "system/com.sites-dashboard.nginx"]
-            return CommandResult("state = running")
+            return CommandResult(f"state = running\npid = {self.main_pid}\n")
+        elif tool == "ps":
+            assert args[1:] == ["-axo", "pid=,ppid=,comm="]
+            return CommandResult(self.processes)
         elif tool == "nginx":
             assert args[1:] in (["-t"], ["-s", "reload"])
         else:
@@ -228,6 +235,76 @@ def test_running_nginx_is_not_a_collision(newsite, config, runner):
     runner.listeners = ('LISTEN 0 128 [::]:80 [::]:* users:(("nginx",pid=123,fd=3))\n'
                         if config.runtime.platform == "linux" else "p123\ncnginx\nn*:80\n")
     assert newsite.create_site("example.test", False, config, runner).success
+
+
+def test_lsof_uses_command_name_width_option(newsite):
+    calls = []
+
+    def inspect(command):
+        calls.append(command)
+        return CommandResult("p123\ncnginx\nn*:80\n")
+
+    assert newsite._lsof_listeners(inspect) == [("nginx", "123", "80")]
+    assert "+c" in calls[0] and calls[0][calls[0].index("+c") + 1] == "0"
+    assert "-c" not in calls[0]
+
+
+@pytest.mark.parametrize("output,want", [("", []), ("p123\ncnginx\nn*:80\n", [("nginx", "123", "80")])])
+def test_lsof_unmatched_port_selection_keeps_valid_listeners(newsite, output, want):
+    assert newsite._lsof_listeners(lambda cmd: CommandResult(output, "", 1)) == want
+
+
+@pytest.mark.parametrize("response", [CommandResult(stderr="sudo: permission denied", returncode=1),
+                                      CommandResult("p123\ncnginx\nn*:80\n", "lsof: inspection failed", 1),
+                                      CommandResult(returncode=2), CommandResult("unparseable output", "", 1)])
+def test_lsof_inspection_failure_is_not_reported_as_free_ports(newsite, response):
+    with pytest.raises(newsite.CreationError, match="Cannot inspect ports"):
+        newsite._lsof_listeners(lambda cmd: response)
+
+
+@pytest.mark.parametrize("pid", [999, 1000])
+def test_active_service_does_not_allow_unrelated_nginx_listener(newsite, config, runner, pid, capsys):
+    runner.listeners = (f'LISTEN 0 128 *:443 *:* users:(("nginx",pid={pid},fd=3))\n'
+                        if config.runtime.platform == "linux" else f"p{pid}\ncnginx\nn*:443\n")
+    result = newsite.create_site("example.test", False, config, runner)
+    assert not result.success
+    assert "443" in result.error and "nginx" in result.error and str(pid) in result.error
+    assert not config.webroot.exists()
+    assert "Site created:" not in capsys.readouterr().out
+
+
+def test_managed_nginx_worker_listener_is_accepted(newsite, config, runner):
+    runner.listeners = ('LISTEN 0 128 *:80 *:* users:(("nginx",pid=124,fd=3))\n'
+                        if config.runtime.platform == "linux" else "p124\ncnginx\nn*:80\n")
+    assert newsite.create_site("example.test", False, config, runner).success
+
+
+@pytest.mark.parametrize("main_pid", ["", "0", "unknown"])
+def test_nginx_listener_without_managed_pid_is_rejected(newsite, config, runner, main_pid):
+    runner.main_pid = main_pid
+    runner.listeners = ('LISTEN 0 128 *:80 *:* users:(("nginx",pid=123,fd=3))\n'
+                        if config.runtime.platform == "linux" else "p123\ncnginx\nn*:80\n")
+    result = newsite.create_site("example.test", False, config, runner)
+    assert not result.success and "123" in result.error
+    assert not config.webroot.exists()
+
+
+@pytest.mark.parametrize("failure", ["ps", "service"])
+def test_nginx_ownership_probe_failure_is_rejected(newsite, config, runner, failure):
+    service_probe = "systemctl" if config.runtime.platform == "linux" else "launchctl"
+    runner.fail = service_probe if failure == "service" else failure
+    runner.listeners = ('LISTEN 0 128 *:80 *:* users:(("nginx",pid=123,fd=3))\n'
+                        if config.runtime.platform == "linux" else "p123\ncnginx\nn*:80\n")
+    result = newsite.create_site("example.test", False, config, runner)
+    assert not result.success and "80" in result.error
+    assert not config.webroot.exists()
+
+
+def test_mixed_managed_and_unrelated_nginx_listeners_are_rejected(newsite, config, runner):
+    runner.listeners = ('LISTEN 0 128 *:80 *:* users:(("nginx",pid=123,fd=3),("nginx",pid=999,fd=4))\n'
+                        if config.runtime.platform == "linux" else "p123\ncnginx\nn*:80\np999\ncnginx\nn*:443\n")
+    assert not newsite.create_site("example.test", False, config, runner).success
+    assert not config.webroot.exists()
 
 
 @pytest.mark.parametrize("domain", ["../outside", "-bad.test", "bad_.test", "a;touch.test", "a..test", "", "127.0.0.1", "x" * 64 + ".test"])
